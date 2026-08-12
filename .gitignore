@@ -1,0 +1,14 @@
+**/bin/
+**/obj/
+.runtime/
+*.user
+*.suo
+.vs/
+.dotnet-cli/
+backups/
+test-backups/
+.env
+.env.*
+!.env.example
+*.local.json
+secrets.json

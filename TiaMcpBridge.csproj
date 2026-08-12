@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>TiaMcpBridge</AssemblyName>
+    <RootNamespace>TiaMcpBridge</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Remove="TiaOpennessWorker\**\*.cs" />
+    <Content Remove="TiaOpennessWorker\**\*" />
+    <None Remove="TiaOpennessWorker\**\*" />
+  </ItemGroup>
+  <Target Name="BuildTiaOpennessWorker" BeforeTargets="Build">
+    <MSBuild Projects="TiaOpennessWorker\TiaOpennessWorker.csproj"
+             Targets="Build"
+             Properties="Configuration=$(Configuration)" />
+  </Target>
+  <Target Name="CopyTiaOpennessWorker" AfterTargets="Build">
+    <ItemGroup>
+      <WorkerFiles Include="TiaOpennessWorker\bin\$(Configuration)\net452\**\*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(WorkerFiles)"
+          DestinationFiles="@(WorkerFiles->'$(OutputPath)worker\%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true" />
+  </Target>
+</Project>

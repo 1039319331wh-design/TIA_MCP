@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TIA Codex Console</title>
+  <meta name="description" content="本机 TIA Portal 与 Codex 工程控制台">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">TC</span>
+      <div><strong>TIA Codex Console</strong><small>本机工程助手 · 受控写入</small></div>
+    </div>
+    <div class="status-cluster">
+      <span id="tiaStatus" class="status pending"><i></i>TIA 检测中</span>
+      <span id="writeStatus" class="status locked"><i></i>写入状态未知</span>
+      <button id="tokenButton" class="ghost-button">连接设置</button>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <aside class="sidebar panel">
+      <div class="panel-heading"><div><span class="eyebrow">PROJECT</span><h2>工程浏览器</h2></div><button id="refreshButton" class="icon-button" title="刷新">↻</button></div>
+      <div id="projectCard" class="project-card skeleton">正在读取打开的项目…</div>
+      <div class="filters">
+        <label>PLC<select id="plcFilter"><option value="">全部 PLC</option></select></label>
+        <label>块类型<select id="typeFilter"><option value="">全部类型</option><option>OB</option><option>FB</option><option>FC</option><option>GlobalDB</option><option>InstanceDB</option></select></label>
+        <label class="wide">搜索<input id="blockSearch" placeholder="块名称或组路径"></label>
+      </div>
+      <div class="list-meta"><span id="blockCount">程序块</span><span>点击块可加入对话上下文</span></div>
+      <div id="blockList" class="block-list"><div class="empty">等待 TIA 数据</div></div>
+    </aside>
+
+    <section class="chat panel">
+      <div class="panel-heading chat-heading">
+        <div><span class="eyebrow">CODEX</span><h1>和你的博途工程对话</h1></div>
+        <button id="newChatButton" class="ghost-button">新对话</button>
+      </div>
+      <div id="contextBar" class="context-bar hidden"><span>当前上下文</span><strong id="contextName"></strong><button id="clearContext">×</button></div>
+      <div id="messages" class="messages">
+        <article class="message assistant welcome">
+          <div class="avatar">C</div><div class="bubble"><h3>我已连接到本机 TIA 工具</h3><p>你可以问：“当前打开了什么项目？”、“列出油系 PLC 的 FB”，或者选择左侧程序块后让我分析逻辑。</p><p class="safety-note">读取和分析可自动执行。任何导入与保存都必须经过独立确认。</p></div>
+        </article>
+      </div>
+      <div id="activity" class="activity hidden"><span class="spinner"></span><span>Codex 正在检查工程…</span></div>
+      <form id="chatForm" class="composer">
+        <textarea id="messageInput" rows="2" placeholder="询问工程，或描述你想做的修改…" required></textarea>
+        <div class="composer-footer"><span>Enter 发送 · Shift+Enter 换行</span><button type="submit" id="sendButton">发送</button></div>
+      </form>
+    </section>
+
+    <aside class="operations panel">
+      <div class="panel-heading"><div><span class="eyebrow">CONTROL</span><h2>操作与审批</h2></div></div>
+      <div class="operation-card safe"><span class="operation-icon">✓</span><div><strong>只读工具</strong><p>状态、项目、设备、块列表和 XML 导出可由 Codex 调用。</p></div></div>
+      <div class="operation-card guarded"><span class="operation-icon">⌁</span><div><strong>程序修改</strong><p>候选 XML 必须先预检并生成一次性令牌。</p></div></div>
+      <div class="operation-card locked-card"><span class="operation-icon">▣</span><div><strong>保存项目</strong><p>使用独立保存令牌；永不自动下载到 PLC。</p></div></div>
+      <div class="audit">
+        <div class="audit-heading"><strong>最近工具活动</strong><button id="clearAudit">清空</button></div>
+        <div id="auditList" class="audit-list"><div class="empty compact">暂无活动</div></div>
+      </div>
+      <div class="api-notice"><span>API</span><p id="apiState">需要在服务端配置 OPENAI_API_KEY</p></div>
+    </aside>
+  </main>
+
+  <dialog id="settingsDialog">
+    <form method="dialog" class="dialog-card">
+      <div><span class="eyebrow">CONNECTION</span><h2>连接设置</h2><p>TIA 服务的 Bearer Token 只保存在当前页面内存中，刷新后清除。</p></div>
+      <label>Bearer Token<input id="tokenInput" type="password" autocomplete="off" placeholder="未启用鉴权时可留空"></label>
+      <label>OpenAI API Key<input id="apiKeyInput" type="password" autocomplete="off" placeholder="留空表示不修改现有配置"></label>
+      <label>模型<input id="modelInput" value="gpt-5.6" autocomplete="off"></label>
+      <p id="settingsMessage" class="settings-message"></p>
+      <div class="dialog-actions"><button value="cancel" class="ghost-button">取消</button><button id="saveSettings" type="button">应用并刷新</button></div>
+    </form>
+  </dialog>
+  <script src="/app.js" defer></script>
+</body>
+</html>
