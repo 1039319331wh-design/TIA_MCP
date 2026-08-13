@@ -78,6 +78,12 @@ app.MapGet("/api/blocks", (TiaOpennessReader tia, string? plc, string? type, str
     Results.Ok(tia.ListBlocks(plc, type, groupContains, nameContains, offset ?? 0, limit ?? 500)));
 app.MapGet("/api/blocks/export", (TiaOpennessReader tia, string plc, string name, string? group) =>
     Results.Ok(tia.ExportBlock(plc, name, group)));
+app.MapGet("/api/tag-tables", (TiaOpennessReader tia, string? plc, string? groupContains, string? nameContains, int? offset, int? limit) =>
+    Results.Ok(tia.ListTagTables(plc, groupContains, nameContains, offset ?? 0, limit ?? 500)));
+app.MapGet("/api/tag-tables/export", (TiaOpennessReader tia, string plc, string name) =>
+    Results.Ok(tia.ExportTagTable(plc, name)));
+app.MapGet("/api/tag-tables/search", (TiaOpennessReader tia, string plc, string name, string query, int? limit) =>
+    Results.Ok(tia.SearchTagTable(plc, name, query, limit ?? 100)));
 app.MapPost("/api/blocks/preview", (TiaOpennessReader tia, BlockChangeRequest request) =>
     Results.Ok(tia.PreviewBlockChange(request.Plc, request.Name, request.Group, request.BaselineHash, request.Xml)));
 app.MapPost("/api/blocks/apply", (TiaOpennessReader tia, ApplyBlockChangeRequest request) =>
@@ -139,6 +145,14 @@ static object CallTool(JsonObject? parameters, TiaOpennessReader tia)
             StringArg(arguments, "plc"), StringArg(arguments, "type"),
             StringArg(arguments, "groupContains"), StringArg(arguments, "nameContains"),
             IntArg(arguments, "offset", 0), IntArg(arguments, "limit", 500)),
+        "tia_list_tag_tables" => tia.ListTagTables(
+            StringArg(arguments, "plc"), StringArg(arguments, "groupContains"), StringArg(arguments, "nameContains"),
+            IntArg(arguments, "offset", 0), IntArg(arguments, "limit", 500)),
+        "tia_export_tag_table" => tia.ExportTagTable(
+            RequiredStringArg(arguments, "plc"), RequiredStringArg(arguments, "name")),
+        "tia_search_tag_table" => tia.SearchTagTable(
+            RequiredStringArg(arguments, "plc"), RequiredStringArg(arguments, "name"),
+            RequiredStringArg(arguments, "query"), IntArg(arguments, "limit", 100)),
         "tia_get_block_overview" => tia.GetBlockOverview(
             RequiredStringArg(arguments, "plc"), RequiredStringArg(arguments, "name"), StringArg(arguments, "group")),
         "tia_search_block_text" => tia.SearchBlockText(
@@ -194,6 +208,26 @@ static object[] ToolDefinitions() =>
         offset = IntegerProperty("Number of matching rows to skip.", 0, null),
         limit = IntegerProperty("Maximum rows to return (1-1000).", 1, 1000)
     }),
+    Tool("tia_list_tag_tables", "List PLC tag tables in the first open project, including nested group paths, with optional filtering and pagination.", new
+    {
+        plc = StringProperty("Filter by exact PLC software name."),
+        groupContains = StringProperty("Filter by tag-table group path substring."),
+        nameContains = StringProperty("Filter by tag-table name substring."),
+        offset = IntegerProperty("Number of matching rows to skip.", 0, null),
+        limit = IntegerProperty("Maximum rows to return (1-1000).", 1, 1000)
+    }),
+    Tool("tia_export_tag_table", "Export one PLC tag table as read-only TIA Portal XML and return a stable SHA-256 hash.", new
+    {
+        plc = StringProperty("Exact PLC software name."),
+        name = StringProperty("Exact tag-table name; names must be unique within the PLC.")
+    }, ["plc", "name"]),
+    Tool("tia_search_tag_table", "Search names, logical addresses, data types, and comments in one PLC tag table without returning its full XML.", new
+    {
+        plc = StringProperty("Exact PLC software name."),
+        name = StringProperty("Exact tag-table name."),
+        query = StringProperty("Case-insensitive text to search for."),
+        limit = IntegerProperty("Maximum matching XML elements to return (1-500).", 1, 500)
+    }, ["plc", "name", "query"]),
     Tool("tia_get_block_overview", "Return a compact PLC block overview with hash, language, compile units, and readable network text.", new
     {
         plc = StringProperty("Exact PLC name."),
@@ -416,6 +450,49 @@ sealed class TiaOpennessReader
         Filter(Execute("blocks"), row =>
             MatchesExact(row, "plc", plc) && MatchesExact(row, "type", type) &&
             MatchesContains(row, "group", groupContains) && MatchesContains(row, "name", nameContains), offset, limit);
+
+    public JsonArray ListTagTables(string? plc = null, string? groupContains = null,
+        string? nameContains = null, int offset = 0, int limit = 500) =>
+        Filter(Execute("tag-tables"), row =>
+            MatchesExact(row, "plc", plc) && MatchesContains(row, "group", groupContains) &&
+            MatchesContains(row, "name", nameContains), offset, limit);
+
+    public JsonObject ExportTagTable(string plc, string name)
+    {
+        var result = Execute("export-tag-table", plc, name) as JsonObject
+            ?? throw new InvalidOperationException("Worker returned an invalid tag-table export.");
+        var xml = result["xml"]?.GetValue<string>() ?? throw new InvalidOperationException("Worker tag-table export did not contain XML.");
+        result["baselineHash"] = ComputeBlockHash(xml);
+        return result;
+    }
+
+    public object SearchTagTable(string plc, string name, string query, int limit)
+    {
+        if (string.IsNullOrWhiteSpace(query)) throw new InvalidOperationException("Search query must not be empty.");
+        if (limit is < 1 or > 500) throw new ArgumentOutOfRangeException(nameof(limit), "Limit must be between 1 and 500.");
+        var export = ExportTagTable(plc, name);
+        var document = ParseXml(export["xml"]!.GetValue<string>());
+        var matches = new List<object>();
+        foreach (var element in document.Descendants())
+        {
+            if (matches.Count >= limit) break;
+            var value = element.Value.Trim();
+            var attributeText = string.Join(" ", element.Attributes().Select(attribute => attribute.Name.LocalName + "=" + attribute.Value));
+            if (!value.Contains(query, StringComparison.OrdinalIgnoreCase) && !attributeText.Contains(query, StringComparison.OrdinalIgnoreCase)) continue;
+            matches.Add(new
+            {
+                element = element.Name.LocalName,
+                attributes = element.Attributes().ToDictionary(attribute => attribute.Name.LocalName, attribute => attribute.Value),
+                text = value.Length <= 500 ? value : value[..500]
+            });
+        }
+        return new
+        {
+            plc, name,
+            baselineHash = export["baselineHash"]?.GetValue<string>(),
+            query, count = matches.Count, truncated = matches.Count == limit, matches
+        };
+    }
 
     public JsonObject ExportBlock(string plc, string name, string? group = null)
     {

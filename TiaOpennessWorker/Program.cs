@@ -24,6 +24,7 @@ namespace TiaOpennessWorker
                     case "projects": data = reader.ListProjects(); break;
                     case "devices": data = reader.ListDevices(); break;
                     case "blocks": data = reader.ListBlocks(); break;
+                    case "tag-tables": data = reader.ListTagTables(); break;
                     case "export-tag-table":
                         if (args.Length < 3) throw new ArgumentException("export-tag-table requires PLC name and tag table name.");
                         data = reader.ExportTagTable(args[1], args[2]);
@@ -188,6 +189,41 @@ namespace TiaOpennessWorker
                 }
                 finally { if (File.Exists(tempPath)) File.Delete(tempPath); }
             });
+        }
+
+        public object ListTagTables()
+        {
+            return WithProject(project =>
+            {
+                var rows = new List<object>();
+                foreach (var device in Enumerate(Get(project, "Devices")))
+                    foreach (var item in Enumerate(Get(device, "DeviceItems")))
+                        WalkDeviceItemForTagTables(item, rows);
+                return rows;
+            });
+        }
+
+        private void WalkDeviceItemForTagTables(object item, List<object> rows)
+        {
+            var serviceType = assembly.GetType("Siemens.Engineering.HW.Features.SoftwareContainer");
+            if (serviceType != null)
+            {
+                var container = GetService(item, serviceType);
+                var software = container == null ? null : Get(container, "Software");
+                var root = software == null ? null : Get(software, "TagTableGroup");
+                if (root != null)
+                    WalkTagTableGroup(root, Convert.ToString(Get(software, "Name")) ?? Convert.ToString(Get(item, "Name")) ?? "PLC", "", rows);
+            }
+            foreach (var child in Enumerate(Get(item, "DeviceItems"))) WalkDeviceItemForTagTables(child, rows);
+        }
+
+        private static void WalkTagTableGroup(object group, string plc, string parent, List<object> rows)
+        {
+            var groupName = Convert.ToString(Get(group, "Name")) ?? "PLC tags";
+            var path = string.IsNullOrEmpty(parent) ? groupName : parent + "/" + groupName;
+            foreach (var table in Enumerate(Get(group, "TagTables")))
+                rows.Add(Row("plc", plc, "group", path, "name", Get(table, "Name")));
+            foreach (var child in Enumerate(Get(group, "Groups"))) WalkTagTableGroup(child, plc, path, rows);
         }
 
         private static void FindTagTables(object group, string tableName, List<object> matches)

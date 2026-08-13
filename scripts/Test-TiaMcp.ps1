@@ -31,6 +31,9 @@ if (-not $tools.result.tools -or $tools.result.tools.name -notcontains 'tia_stat
 if ($tools.result.tools.name -notcontains 'tia_diagnostics') {
     throw 'MCP tool discovery did not return tia_diagnostics.'
 }
+foreach ($requiredTool in 'tia_list_tag_tables', 'tia_export_tag_table', 'tia_search_tag_table') {
+    if ($tools.result.tools.name -notcontains $requiredTool) { throw "MCP tool discovery did not return $requiredTool." }
+}
 
 $result = [ordered]@{
     ok = $true

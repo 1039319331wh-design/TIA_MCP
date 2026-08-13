@@ -78,6 +78,8 @@ url = "http://127.0.0.1:5111/mcp"
 
 修改前先调用 `tia_get_block_overview` 获取块语言、网络数量和可读文本；需要定位注释或字符串时调用 `tia_search_block_text`。只有定位结果唯一且基线哈希未变化时，再调用候选生成工具。这样可以避免为了查找一段内容把整份 TIA XML 送入对话上下文。
 
+分析 PLC 符号和 I/O 时，先调用 `tia_list_tag_tables`，再用 `tia_search_tag_table` 搜索变量名、地址、类型或注释；仅在确实需要完整结构时调用 `tia_export_tag_table`。变量表能力当前严格只读。
+
 ## 写入模式
 
 默认启动是只读的。只有准备执行已经审核的变更时，才在当前 PowerShell 进程中设置密钥并显式开启写入：

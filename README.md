@@ -125,6 +125,9 @@ http://<虚拟机IP>:5111/mcp
 - `tia_list_projects`
 - `tia_list_devices`
 - `tia_list_blocks`
+- `tia_list_tag_tables`
+- `tia_export_tag_table`
+- `tia_search_tag_table`
 - `tia_export_block`
 - `tia_preview_block_change`
 - `tia_apply_block_change`（默认禁用）
@@ -132,6 +135,8 @@ http://<虚拟机IP>:5111/mcp
 - `tia_save_project`（默认禁用）
 
 `tia_list_devices` 和 `tia_list_blocks` 的 MCP 参数与上述 REST 筛选参数一致。
+
+变量表工具支持按 PLC、分组路径和名称筛选。`tia_export_tag_table` 返回只读 XML 与稳定哈希；优先使用 `tia_search_tag_table` 按变量名、逻辑地址、数据类型或注释检索，避免将完整变量表放入对话上下文。
 
 `tia_export_block` 需要 `plc` 和 `name`，并接受可选的精确 `group` 路径。若存在同名块，必须指定组路径。该工具只导出 XML，不修改工程。
 
