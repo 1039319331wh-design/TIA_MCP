@@ -130,6 +130,8 @@ http://<虚拟机IP>:5111/mcp
 - `tia_search_tag_table`
 - `tia_get_tag_table_overview`
 - `tia_get_plc_overview`
+- `tia_get_block_interface`
+- `tia_search_plc_blocks`
 - `tia_export_block`
 - `tia_preview_block_change`
 - `tia_apply_block_change`（默认禁用）
@@ -141,6 +143,8 @@ http://<虚拟机IP>:5111/mcp
 变量表工具支持按 PLC、分组路径和名称筛选。`tia_export_tag_table` 返回只读 XML 与稳定哈希；优先使用 `tia_search_tag_table` 按变量名、逻辑地址、数据类型或注释检索，避免将完整变量表放入对话上下文。
 
 开始分析一个 PLC 时，建议先调用 `tia_get_plc_overview` 获取块类型、编程语言、程序分组和变量表清单。`tia_get_tag_table_overview` 会将变量表解析为紧凑的结构化条目，适合分批读取名称、逻辑地址、数据类型与注释。
+
+`tia_get_block_interface` 将 FB、FC、OB 和 DB 的接口解析为 Input、Output、InOut、Static、Temp、Constant、Return 等区段，并保留嵌套成员和注释。`tia_search_plc_blocks` 可在受限数量的块中搜索符号、注释或调用痕迹；大型项目应通过 `type`、`groupContains` 和 `maxBlocks` 缩小范围。
 
 `tia_export_block` 需要 `plc` 和 `name`，并接受可选的精确 `group` 路径。若存在同名块，必须指定组路径。该工具只导出 XML，不修改工程。
 

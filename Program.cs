@@ -88,6 +88,10 @@ app.MapGet("/api/plcs/{plc}/overview", (TiaOpennessReader tia, string plc) =>
     Results.Ok(tia.GetPlcOverview(plc)));
 app.MapGet("/api/tag-tables/overview", (TiaOpennessReader tia, string plc, string name, int? offset, int? limit) =>
     Results.Ok(tia.GetTagTableOverview(plc, name, offset ?? 0, limit ?? 200)));
+app.MapGet("/api/blocks/interface", (TiaOpennessReader tia, string plc, string name, string? group) =>
+    Results.Ok(tia.GetBlockInterface(plc, name, group)));
+app.MapGet("/api/blocks/search-all", (TiaOpennessReader tia, string plc, string query, string? type, string? groupContains, int? maxBlocks, int? limit) =>
+    Results.Ok(tia.SearchPlcBlocks(plc, query, type, groupContains, maxBlocks ?? 100, limit ?? 100)));
 app.MapPost("/api/blocks/preview", (TiaOpennessReader tia, BlockChangeRequest request) =>
     Results.Ok(tia.PreviewBlockChange(request.Plc, request.Name, request.Group, request.BaselineHash, request.Xml)));
 app.MapPost("/api/blocks/apply", (TiaOpennessReader tia, ApplyBlockChangeRequest request) =>
@@ -161,6 +165,12 @@ static object CallTool(JsonObject? parameters, TiaOpennessReader tia)
         "tia_get_tag_table_overview" => tia.GetTagTableOverview(
             RequiredStringArg(arguments, "plc"), RequiredStringArg(arguments, "name"),
             IntArg(arguments, "offset", 0), IntArg(arguments, "limit", 200)),
+        "tia_get_block_interface" => tia.GetBlockInterface(
+            RequiredStringArg(arguments, "plc"), RequiredStringArg(arguments, "name"), StringArg(arguments, "group")),
+        "tia_search_plc_blocks" => tia.SearchPlcBlocks(
+            RequiredStringArg(arguments, "plc"), RequiredStringArg(arguments, "query"),
+            StringArg(arguments, "type"), StringArg(arguments, "groupContains"),
+            IntArg(arguments, "maxBlocks", 100), IntArg(arguments, "limit", 100)),
         "tia_get_block_overview" => tia.GetBlockOverview(
             RequiredStringArg(arguments, "plc"), RequiredStringArg(arguments, "name"), StringArg(arguments, "group")),
         "tia_search_block_text" => tia.SearchBlockText(
@@ -247,6 +257,21 @@ static object[] ToolDefinitions() =>
         offset = IntegerProperty("Number of tag entries to skip.", 0, null),
         limit = IntegerProperty("Maximum tag entries to return (1-1000).", 1, 1000)
     }, ["plc", "name"]),
+    Tool("tia_get_block_interface", "Parse one PLC block interface into Input, Output, InOut, Static, Temp, Constant, and Return members.", new
+    {
+        plc = StringProperty("Exact PLC software name."),
+        name = StringProperty("Exact block name."),
+        group = StringProperty("Exact block-group path. Optional unless the block name is ambiguous.")
+    }, ["plc", "name"]),
+    Tool("tia_search_plc_blocks", "Search a symbol, comment, or call-related text across multiple blocks in one PLC with bounded scanning.", new
+    {
+        plc = StringProperty("Exact PLC software name."),
+        query = StringProperty("Case-insensitive text to search for."),
+        type = StringProperty("Optional exact block type filter, such as OB, FB, FC, GlobalDB, or InstanceDB."),
+        groupContains = StringProperty("Optional block-group path substring."),
+        maxBlocks = IntegerProperty("Maximum blocks to export and scan (1-500).", 1, 500),
+        limit = IntegerProperty("Maximum matching blocks to return (1-500).", 1, 500)
+    }, ["plc", "query"]),
     Tool("tia_get_block_overview", "Return a compact PLC block overview with hash, language, compile units, and readable network text.", new
     {
         plc = StringProperty("Exact PLC name."),
@@ -606,6 +631,83 @@ sealed class TiaOpennessReader
             programmingLanguages = document.Descendants().Where(element => element.Name.LocalName == "ProgrammingLanguage")
                 .Select(element => element.Value).Distinct(StringComparer.Ordinal).ToArray(),
             compileUnits
+        };
+    }
+
+    public object GetBlockInterface(string plc, string name, string? group)
+    {
+        var export = ExportBlock(plc, name, group);
+        var document = ParseXml(export["xml"]!.GetValue<string>());
+        var sections = document.Descendants().Where(element => element.Name.LocalName == "Section")
+            .Select(section => new
+            {
+                name = section.Attribute("Name")?.Value ?? "Unknown",
+                members = section.Elements().Where(element => element.Name.LocalName == "Member")
+                    .Select(ParseInterfaceMember).ToArray()
+            }).ToArray();
+        return new
+        {
+            plc,
+            group = export["group"]?.GetValue<string>(),
+            name,
+            type = export["type"]?.GetValue<string>(),
+            baselineHash = export["baselineHash"]?.GetValue<string>(),
+            totalMembers = sections.Sum(section => section.members.Length),
+            sections
+        };
+    }
+
+    public object SearchPlcBlocks(string plc, string query, string? type, string? groupContains, int maxBlocks, int limit)
+    {
+        if (string.IsNullOrWhiteSpace(query)) throw new InvalidOperationException("Search query must not be empty.");
+        if (maxBlocks is < 1 or > 500) throw new ArgumentOutOfRangeException(nameof(maxBlocks), "MaxBlocks must be between 1 and 500.");
+        if (limit is < 1 or > 500) throw new ArgumentOutOfRangeException(nameof(limit), "Limit must be between 1 and 500.");
+        var candidates = ListBlocks(plc, type, groupContains, null, 0, maxBlocks).OfType<JsonObject>().ToArray();
+        var matches = new List<object>();
+        foreach (var candidate in candidates)
+        {
+            if (matches.Count >= limit) break;
+            var blockName = candidate["name"]?.GetValue<string>();
+            var blockGroup = candidate["group"]?.GetValue<string>();
+            if (string.IsNullOrWhiteSpace(blockName)) continue;
+            var export = ExportBlock(plc, blockName, blockGroup);
+            var document = ParseXml(export["xml"]!.GetValue<string>());
+            var snippets = document.Descendants()
+                .Where(element => element.Name.LocalName is "Text" or "Component" or "Symbol" or "Constant" or "Member")
+                .Select(element => new
+                {
+                    element = element.Name.LocalName,
+                    text = (element.Attribute("Name")?.Value ?? element.Value).Trim()
+                })
+                .Where(item => item.text.Contains(query, StringComparison.OrdinalIgnoreCase))
+                .DistinctBy(item => item.element + "\0" + item.text)
+                .Take(20).ToArray();
+            if (snippets.Length == 0) continue;
+            matches.Add(new
+            {
+                plc, group = blockGroup, name = blockName,
+                type = candidate["type"]?.GetValue<string>(),
+                programmingLanguage = candidate["programmingLanguage"]?.GetValue<string>(),
+                baselineHash = export["baselineHash"]?.GetValue<string>(),
+                snippets
+            });
+        }
+        return new { plc, query, type, groupContains, scannedBlocks = candidates.Length, count = matches.Count, truncated = matches.Count == limit, matches };
+    }
+
+    private static object ParseInterfaceMember(XElement member)
+    {
+        var children = member.Elements().Where(element => element.Name.LocalName == "Member").Select(ParseInterfaceMember).ToArray();
+        var comments = member.Descendants().Where(element => element.Name.LocalName is "Text" or "Comment")
+            .Select(element => element.Value.Trim()).Where(value => value.Length > 0).Distinct(StringComparer.Ordinal).ToArray();
+        return new
+        {
+            name = member.Attribute("Name")?.Value,
+            dataType = member.Attribute("Datatype")?.Value ?? member.Attribute("DataType")?.Value,
+            accessibility = member.Attribute("Accessibility")?.Value,
+            retain = member.Attribute("Retain")?.Value,
+            comments,
+            members = children
         };
     }
 
