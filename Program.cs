@@ -84,6 +84,10 @@ app.MapGet("/api/tag-tables/export", (TiaOpennessReader tia, string plc, string 
     Results.Ok(tia.ExportTagTable(plc, name)));
 app.MapGet("/api/tag-tables/search", (TiaOpennessReader tia, string plc, string name, string query, int? limit) =>
     Results.Ok(tia.SearchTagTable(plc, name, query, limit ?? 100)));
+app.MapGet("/api/plcs/{plc}/overview", (TiaOpennessReader tia, string plc) =>
+    Results.Ok(tia.GetPlcOverview(plc)));
+app.MapGet("/api/tag-tables/overview", (TiaOpennessReader tia, string plc, string name, int? offset, int? limit) =>
+    Results.Ok(tia.GetTagTableOverview(plc, name, offset ?? 0, limit ?? 200)));
 app.MapPost("/api/blocks/preview", (TiaOpennessReader tia, BlockChangeRequest request) =>
     Results.Ok(tia.PreviewBlockChange(request.Plc, request.Name, request.Group, request.BaselineHash, request.Xml)));
 app.MapPost("/api/blocks/apply", (TiaOpennessReader tia, ApplyBlockChangeRequest request) =>
@@ -153,6 +157,10 @@ static object CallTool(JsonObject? parameters, TiaOpennessReader tia)
         "tia_search_tag_table" => tia.SearchTagTable(
             RequiredStringArg(arguments, "plc"), RequiredStringArg(arguments, "name"),
             RequiredStringArg(arguments, "query"), IntArg(arguments, "limit", 100)),
+        "tia_get_plc_overview" => tia.GetPlcOverview(RequiredStringArg(arguments, "plc")),
+        "tia_get_tag_table_overview" => tia.GetTagTableOverview(
+            RequiredStringArg(arguments, "plc"), RequiredStringArg(arguments, "name"),
+            IntArg(arguments, "offset", 0), IntArg(arguments, "limit", 200)),
         "tia_get_block_overview" => tia.GetBlockOverview(
             RequiredStringArg(arguments, "plc"), RequiredStringArg(arguments, "name"), StringArg(arguments, "group")),
         "tia_search_block_text" => tia.SearchBlockText(
@@ -228,6 +236,17 @@ static object[] ToolDefinitions() =>
         query = StringProperty("Case-insensitive text to search for."),
         limit = IntegerProperty("Maximum matching XML elements to return (1-500).", 1, 500)
     }, ["plc", "name", "query"]),
+    Tool("tia_get_plc_overview", "Return a compact PLC inventory with block type/language counts, group paths, and tag-table summaries.", new
+    {
+        plc = StringProperty("Exact PLC software name.")
+    }, ["plc"]),
+    Tool("tia_get_tag_table_overview", "Parse one PLC tag table into compact structured tags with name, logical address, data type, and comments.", new
+    {
+        plc = StringProperty("Exact PLC software name."),
+        name = StringProperty("Exact tag-table name."),
+        offset = IntegerProperty("Number of tag entries to skip.", 0, null),
+        limit = IntegerProperty("Maximum tag entries to return (1-1000).", 1, 1000)
+    }, ["plc", "name"]),
     Tool("tia_get_block_overview", "Return a compact PLC block overview with hash, language, compile units, and readable network text.", new
     {
         plc = StringProperty("Exact PLC name."),
@@ -472,27 +491,85 @@ sealed class TiaOpennessReader
         if (limit is < 1 or > 500) throw new ArgumentOutOfRangeException(nameof(limit), "Limit must be between 1 and 500.");
         var export = ExportTagTable(plc, name);
         var document = ParseXml(export["xml"]!.GetValue<string>());
-        var matches = new List<object>();
-        foreach (var element in document.Descendants())
-        {
-            if (matches.Count >= limit) break;
-            var value = element.Value.Trim();
-            var attributeText = string.Join(" ", element.Attributes().Select(attribute => attribute.Name.LocalName + "=" + attribute.Value));
-            if (!value.Contains(query, StringComparison.OrdinalIgnoreCase) && !attributeText.Contains(query, StringComparison.OrdinalIgnoreCase)) continue;
-            matches.Add(new
-            {
-                element = element.Name.LocalName,
-                attributes = element.Attributes().ToDictionary(attribute => attribute.Name.LocalName, attribute => attribute.Value),
-                text = value.Length <= 500 ? value : value[..500]
-            });
-        }
+        var allTags = ParseTagEntries(document).ToArray();
+        var matches = allTags.Where(tag => tag.SearchText.Contains(query, StringComparison.OrdinalIgnoreCase)).Take(limit)
+            .Select(tag => tag.Value).ToArray();
         return new
         {
             plc, name,
             baselineHash = export["baselineHash"]?.GetValue<string>(),
-            query, count = matches.Count, truncated = matches.Count == limit, matches
+            query, count = matches.Length, totalMatching = allTags.Count(tag => tag.SearchText.Contains(query, StringComparison.OrdinalIgnoreCase)),
+            truncated = matches.Length == limit, matches
         };
     }
+
+    public object GetTagTableOverview(string plc, string name, int offset, int limit)
+    {
+        if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset), "Offset must not be negative.");
+        if (limit is < 1 or > 1000) throw new ArgumentOutOfRangeException(nameof(limit), "Limit must be between 1 and 1000.");
+        var export = ExportTagTable(plc, name);
+        var tags = ParseTagEntries(ParseXml(export["xml"]!.GetValue<string>())).Select(tag => tag.Value).ToArray();
+        return new
+        {
+            plc, name,
+            baselineHash = export["baselineHash"]?.GetValue<string>(),
+            total = tags.Length, offset, limit,
+            returned = Math.Min(limit, Math.Max(0, tags.Length - offset)),
+            tags = tags.Skip(offset).Take(limit).ToArray()
+        };
+    }
+
+    public object GetPlcOverview(string plc)
+    {
+        var blocks = ListBlocks(plc: plc, limit: 1000).OfType<JsonObject>().ToArray();
+        var tagTables = ListTagTables(plc: plc, limit: 1000).OfType<JsonObject>().ToArray();
+        if (blocks.Length == 0 && tagTables.Length == 0)
+            throw new InvalidOperationException($"PLC software not found or contains no visible blocks/tag tables: {plc}");
+        return new
+        {
+            plc,
+            blocks = new
+            {
+                total = blocks.Length,
+                byType = CountBy(blocks, "type"),
+                byLanguage = CountBy(blocks, "programmingLanguage"),
+                groups = blocks.Select(row => row["group"]?.GetValue<string>()).Where(value => !string.IsNullOrWhiteSpace(value))
+                    .Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(value => value, StringComparer.OrdinalIgnoreCase).ToArray()
+            },
+            tagTables = new
+            {
+                total = tagTables.Length,
+                groups = tagTables.Select(row => row["group"]?.GetValue<string>()).Where(value => !string.IsNullOrWhiteSpace(value))
+                    .Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(value => value, StringComparer.OrdinalIgnoreCase).ToArray(),
+                tables = tagTables.Select(row => new { group = row["group"]?.GetValue<string>(), name = row["name"]?.GetValue<string>() }).ToArray()
+            }
+        };
+    }
+
+    private sealed record ParsedTag(object Value, string SearchText);
+
+    private static IEnumerable<ParsedTag> ParseTagEntries(XDocument document)
+    {
+        foreach (var element in document.Descendants().Where(element =>
+                     element.Name.LocalName is "SW.Tags.PlcTag" or "PlcTag"))
+        {
+            var attributes = element.Descendants().Where(child => child.Name.LocalName == "AttributeList").FirstOrDefault() ?? element;
+            string? Read(string localName) => attributes.Descendants().FirstOrDefault(child => child.Name.LocalName == localName)?.Value.Trim();
+            var comments = element.Descendants().Where(child => child.Name.LocalName is "Text" or "Comment")
+                .Select(child => child.Value.Trim()).Where(value => value.Length > 0).Distinct(StringComparer.Ordinal).ToArray();
+            var tagName = Read("Name") ?? element.Attribute("Name")?.Value;
+            var address = Read("LogicalAddress") ?? Read("Address");
+            var dataType = Read("DataTypeName") ?? Read("DataType");
+            var value = new { name = tagName, logicalAddress = address, dataType, comments };
+            yield return new ParsedTag(value, string.Join("\n", new[] { tagName, address, dataType }.Where(text => !string.IsNullOrWhiteSpace(text)).Concat(comments)));
+        }
+    }
+
+    private static Dictionary<string, int> CountBy(IEnumerable<JsonObject> rows, string property) =>
+        rows.Select(row => row[property]?.GetValue<string>()).Where(value => !string.IsNullOrWhiteSpace(value))
+            .GroupBy(value => value!, StringComparer.OrdinalIgnoreCase)
+            .OrderBy(group => group.Key, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.Count(), StringComparer.OrdinalIgnoreCase);
 
     public JsonObject ExportBlock(string plc, string name, string? group = null)
     {

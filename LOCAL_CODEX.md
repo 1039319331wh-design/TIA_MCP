@@ -80,6 +80,8 @@ url = "http://127.0.0.1:5111/mcp"
 
 分析 PLC 符号和 I/O 时，先调用 `tia_list_tag_tables`，再用 `tia_search_tag_table` 搜索变量名、地址、类型或注释；仅在确实需要完整结构时调用 `tia_export_tag_table`。变量表能力当前严格只读。
 
+首次接触项目中的某个 PLC 时，先调用 `tia_get_plc_overview` 建立块类型、语言、分组和变量表地图。需要批量理解变量时使用 `tia_get_tag_table_overview` 分页读取，避免无目标地导出大量 XML。
+
 ## 写入模式
 
 默认启动是只读的。只有准备执行已经审核的变更时，才在当前 PowerShell 进程中设置密钥并显式开启写入：
