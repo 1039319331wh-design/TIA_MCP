@@ -104,6 +104,10 @@ app.MapGet("/api/data-blocks", (TiaOpennessReader tia, string plc, string? group
     Results.Ok(tia.ListDataBlocks(plc, groupContains, nameContains, offset ?? 0, limit ?? 500)));
 app.MapGet("/api/data-blocks/overview", (TiaOpennessReader tia, string plc, string name, string? group, int? offset, int? limit) =>
     Results.Ok(tia.GetDataBlockOverview(plc, name, group, offset ?? 0, limit ?? 500)));
+app.MapGet("/api/blocks/networks", (TiaOpennessReader tia, string plc, string name, string? group, int? offset, int? limit) =>
+    Results.Ok(tia.GetBlockNetworks(plc, name, group, offset ?? 0, limit ?? 100)));
+app.MapGet("/api/blocks/references", (TiaOpennessReader tia, string plc, string name, string? group) =>
+    Results.Ok(tia.GetBlockReferences(plc, name, group)));
 app.MapPost("/api/blocks/preview", (TiaOpennessReader tia, BlockChangeRequest request) =>
     Results.Ok(tia.PreviewBlockChange(request.Plc, request.Name, request.Group, request.BaselineHash, request.Xml)));
 app.MapPost("/api/blocks/apply", (TiaOpennessReader tia, ApplyBlockChangeRequest request) =>
@@ -196,6 +200,11 @@ static object CallTool(JsonObject? parameters, TiaOpennessReader tia)
         "tia_get_data_block_overview" => tia.GetDataBlockOverview(
             RequiredStringArg(arguments, "plc"), RequiredStringArg(arguments, "name"), StringArg(arguments, "group"),
             IntArg(arguments, "offset", 0), IntArg(arguments, "limit", 500)),
+        "tia_get_block_networks" => tia.GetBlockNetworks(
+            RequiredStringArg(arguments, "plc"), RequiredStringArg(arguments, "name"), StringArg(arguments, "group"),
+            IntArg(arguments, "offset", 0), IntArg(arguments, "limit", 100)),
+        "tia_get_block_references" => tia.GetBlockReferences(
+            RequiredStringArg(arguments, "plc"), RequiredStringArg(arguments, "name"), StringArg(arguments, "group")),
         "tia_get_block_overview" => tia.GetBlockOverview(
             RequiredStringArg(arguments, "plc"), RequiredStringArg(arguments, "name"), StringArg(arguments, "group")),
         "tia_search_block_text" => tia.SearchBlockText(
@@ -332,6 +341,20 @@ static object[] ToolDefinitions() =>
         group = StringProperty("Exact block-group path. Optional unless the name is ambiguous."),
         offset = IntegerProperty("Number of flattened members to skip.", 0, null),
         limit = IntegerProperty("Maximum flattened members to return (1-2000).", 1, 2000)
+    }, ["plc", "name"]),
+    Tool("tia_get_block_networks", "Return LAD/FBD/SCL compile units as network-level summaries with titles, comments, symbols, calls, and instruction parts.", new
+    {
+        plc = StringProperty("Exact PLC software name."),
+        name = StringProperty("Exact block name."),
+        group = StringProperty("Exact block-group path. Optional unless the name is ambiguous."),
+        offset = IntegerProperty("Number of networks to skip.", 0, null),
+        limit = IntegerProperty("Maximum networks to return (1-500).", 1, 500)
+    }, ["plc", "name"]),
+    Tool("tia_get_block_references", "Return a compact unique reference summary for one block, including symbols, scopes, calls, instances, constants, and instructions.", new
+    {
+        plc = StringProperty("Exact PLC software name."),
+        name = StringProperty("Exact block name."),
+        group = StringProperty("Exact block-group path. Optional unless the name is ambiguous.")
     }, ["plc", "name"]),
     Tool("tia_get_block_overview", "Return a compact PLC block overview with hash, language, compile units, and readable network text.", new
     {
@@ -785,6 +808,93 @@ sealed class TiaOpennessReader
             attributes, comments, childCount = children.Length
         });
         foreach (var child in children) FlattenDataBlockMember(child, section, path, depth + 1, rows);
+    }
+
+    public object GetBlockNetworks(string plc, string name, string? group, int offset, int limit)
+    {
+        if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset), "Offset must not be negative.");
+        if (limit is < 1 or > 500) throw new ArgumentOutOfRangeException(nameof(limit), "Limit must be between 1 and 500.");
+        var export = ExportBlock(plc, name, group);
+        var document = ParseXml(export["xml"]!.GetValue<string>());
+        var knownBlockNames = ListBlocks(plc: plc, limit: 1000).OfType<JsonObject>()
+            .Select(row => row["name"]?.GetValue<string>()).Where(value => !string.IsNullOrWhiteSpace(value))
+            .Select(value => value!).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var networks = document.Descendants().Where(element => element.Name.LocalName.EndsWith("CompileUnit", StringComparison.Ordinal))
+            .Select((unit, index) => ParseNetwork(unit, index, knownBlockNames)).ToArray();
+        return new
+        {
+            plc, group = export["group"]?.GetValue<string>(), name,
+            type = export["type"]?.GetValue<string>(), baselineHash = export["baselineHash"]?.GetValue<string>(),
+            totalNetworks = networks.Length, offset, limit,
+            returned = Math.Min(limit, Math.Max(0, networks.Length - offset)),
+            networks = networks.Skip(offset).Take(limit).ToArray()
+        };
+    }
+
+    public object GetBlockReferences(string plc, string name, string? group)
+    {
+        var export = ExportBlock(plc, name, group);
+        var document = ParseXml(export["xml"]!.GetValue<string>());
+        var accesses = document.Descendants().Where(element => element.Name.LocalName == "Access").Select(access => new
+        {
+            scope = access.Attribute("Scope")?.Value,
+            symbol = JoinComponents(access.Descendants().Where(element => element.Name.LocalName == "Symbol").FirstOrDefault()),
+            constant = access.Descendants().FirstOrDefault(element => element.Name.LocalName == "Constant")?.Attribute("Name")?.Value
+                       ?? access.Descendants().FirstOrDefault(element => element.Name.LocalName == "ConstantValue")?.Value.Trim()
+        }).ToArray();
+        var parts = document.Descendants().Where(element => element.Name.LocalName == "Part").Select(part => part.Attribute("Name")?.Value)
+            .Where(value => !string.IsNullOrWhiteSpace(value)).Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(value => value, StringComparer.OrdinalIgnoreCase).ToArray();
+        var instances = document.Descendants().Where(element => element.Name.LocalName == "Instance")
+            .Select(instance => JoinComponents(instance)).Where(value => !string.IsNullOrWhiteSpace(value))
+            .Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(value => value, StringComparer.OrdinalIgnoreCase).ToArray();
+        return new
+        {
+            plc, group = export["group"]?.GetValue<string>(), name,
+            type = export["type"]?.GetValue<string>(), baselineHash = export["baselineHash"]?.GetValue<string>(),
+            scopes = accesses.Where(item => !string.IsNullOrWhiteSpace(item.scope)).GroupBy(item => item.scope!, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(group => group.Key, group => group.Count(), StringComparer.OrdinalIgnoreCase),
+            symbols = accesses.Select(item => item.symbol).Where(value => !string.IsNullOrWhiteSpace(value)).Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(value => value, StringComparer.OrdinalIgnoreCase).ToArray(),
+            constants = accesses.Select(item => item.constant).Where(value => !string.IsNullOrWhiteSpace(value)).Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(value => value, StringComparer.OrdinalIgnoreCase).ToArray(),
+            instances, parts
+        };
+    }
+
+    private static object ParseNetwork(XElement unit, int index, HashSet<string> knownBlockNames)
+    {
+        var objectList = unit.Elements().FirstOrDefault(element => element.Name.LocalName == "ObjectList");
+        string[] Multilingual(string composition) => objectList?.Elements()
+            .Where(element => element.Name.LocalName == "MultilingualText" && string.Equals(element.Attribute("CompositionName")?.Value, composition, StringComparison.OrdinalIgnoreCase))
+            .SelectMany(element => element.Descendants().Where(child => child.Name.LocalName == "MultilingualTextItem"))
+            .Select(item =>
+            {
+                var culture = item.Descendants().FirstOrDefault(element => element.Name.LocalName == "Culture")?.Value.Trim();
+                var text = item.Descendants().FirstOrDefault(element => element.Name.LocalName == "Text")?.Value.Trim();
+                return string.IsNullOrWhiteSpace(text) ? null : (string.IsNullOrWhiteSpace(culture) ? text : culture + ": " + text);
+            }).Where(value => value is not null).Select(value => value!).ToArray() ?? [];
+        var source = unit.Descendants().FirstOrDefault(element => element.Name.LocalName == "NetworkSource");
+        var symbols = source?.Descendants().Where(element => element.Name.LocalName == "Symbol").Select(JoinComponents)
+            .Where(value => !string.IsNullOrWhiteSpace(value)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray() ?? [];
+        var parts = source?.Descendants().Where(element => element.Name.LocalName == "Part").Select(element => element.Attribute("Name")?.Value)
+            .Where(value => !string.IsNullOrWhiteSpace(value)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray() ?? [];
+        return new
+        {
+            index,
+            programmingLanguage = unit.Descendants().FirstOrDefault(element => element.Name.LocalName == "ProgrammingLanguage")?.Value.Trim(),
+            titles = Multilingual("Title"), comments = Multilingual("Comment"),
+            symbols,
+            calls = parts.Where(part => knownBlockNames.Contains(part!)).ToArray(),
+            instructions = parts.Where(part => !knownBlockNames.Contains(part!)).ToArray(),
+            instances = source?.Descendants().Where(element => element.Name.LocalName == "Instance").Select(JoinComponents)
+                .Where(value => !string.IsNullOrWhiteSpace(value)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray() ?? []
+        };
+    }
+
+    private static string? JoinComponents(XElement? element)
+    {
+        if (element is null) return null;
+        var names = element.DescendantsAndSelf().Where(child => child.Name.LocalName == "Component")
+            .Select(child => child.Attribute("Name")?.Value).Where(value => !string.IsNullOrWhiteSpace(value)).ToArray();
+        return names.Length == 0 ? null : string.Join(".", names);
     }
 
     public object SearchPlcBlocks(string plc, string query, string? type, string? groupContains, int maxBlocks, int limit)
