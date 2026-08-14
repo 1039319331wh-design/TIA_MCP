@@ -141,6 +141,7 @@ http://<虚拟机IP>:5111/mcp
 - `tia_get_block_networks`
 - `tia_get_block_references`
 - `tia_audit_plc_io`
+- `tia_audit_symbol_usage`
 - `tia_export_block`
 - `tia_preview_block_change`
 - `tia_apply_block_change`（默认禁用）
@@ -164,6 +165,8 @@ http://<虚拟机IP>:5111/mcp
 `tia_get_block_networks` 按 `CompileUnit` 返回每个网络的语言、标题、注释、符号路径、实例、调用块与指令部件，适合逐网络解释 LAD/FBD。`tia_get_block_references` 提供单块唯一引用摘要，包括访问作用域、符号、常量、实例和部件名称；调用识别只接受当前 PLC 中真实存在的块名。
 
 `tia_audit_plc_io` 遍历指定 PLC 的变量表，统计输入、输出、M 区、DB、定时器和计数器等地址区域，并报告精确地址重复、符号名重复、缺失数据类型和缺失注释。地址冲突仅按标准化后的完整地址文本判断，不推断位、字节、字或双字之间的范围重叠。
+
+`tia_audit_symbol_usage` 将变量表定义与受限数量程序块内的 `GlobalVariable` 引用交叉比对，返回已解析符号、可能未使用定义、未解析直接全局符号以及需复核的 DB/结构成员路径。“可能未使用”不能作为删除依据，因为 HMI、报警、配方、间接访问、外部系统或未扫描块仍可能引用该变量。
 
 `tia_export_block` 需要 `plc` 和 `name`，并接受可选的精确 `group` 路径。若存在同名块，必须指定组路径。该工具只导出 XML，不修改工程。
 

@@ -110,6 +110,8 @@ app.MapGet("/api/blocks/references", (TiaOpennessReader tia, string plc, string 
     Results.Ok(tia.GetBlockReferences(plc, name, group)));
 app.MapGet("/api/plcs/{plc}/io-audit", (TiaOpennessReader tia, string plc, int? maxTagTables, int? issueLimit) =>
     Results.Ok(tia.AuditPlcIo(plc, maxTagTables ?? 200, issueLimit ?? 500)));
+app.MapGet("/api/plcs/{plc}/symbol-usage", (TiaOpennessReader tia, string plc, int? maxBlocks, int? maxTagTables, int? issueLimit) =>
+    Results.Ok(tia.AuditSymbolUsage(plc, maxBlocks ?? 200, maxTagTables ?? 200, issueLimit ?? 500)));
 app.MapPost("/api/blocks/preview", (TiaOpennessReader tia, BlockChangeRequest request) =>
     Results.Ok(tia.PreviewBlockChange(request.Plc, request.Name, request.Group, request.BaselineHash, request.Xml)));
 app.MapPost("/api/blocks/apply", (TiaOpennessReader tia, ApplyBlockChangeRequest request) =>
@@ -209,6 +211,9 @@ static object CallTool(JsonObject? parameters, TiaOpennessReader tia)
             RequiredStringArg(arguments, "plc"), RequiredStringArg(arguments, "name"), StringArg(arguments, "group")),
         "tia_audit_plc_io" => tia.AuditPlcIo(
             RequiredStringArg(arguments, "plc"), IntArg(arguments, "maxTagTables", 200), IntArg(arguments, "issueLimit", 500)),
+        "tia_audit_symbol_usage" => tia.AuditSymbolUsage(
+            RequiredStringArg(arguments, "plc"), IntArg(arguments, "maxBlocks", 200),
+            IntArg(arguments, "maxTagTables", 200), IntArg(arguments, "issueLimit", 500)),
         "tia_get_block_overview" => tia.GetBlockOverview(
             RequiredStringArg(arguments, "plc"), RequiredStringArg(arguments, "name"), StringArg(arguments, "group")),
         "tia_search_block_text" => tia.SearchBlockText(
@@ -365,6 +370,13 @@ static object[] ToolDefinitions() =>
         plc = StringProperty("Exact PLC software name."),
         maxTagTables = IntegerProperty("Maximum tag tables to export and audit (1-200).", 1, 200),
         issueLimit = IntegerProperty("Maximum issues returned per issue category (1-2000).", 1, 2000)
+    }, ["plc"]),
+    Tool("tia_audit_symbol_usage", "Cross-check PLC tag definitions against bounded block exports to find possibly unused tags and unresolved global symbol references.", new
+    {
+        plc = StringProperty("Exact PLC software name."),
+        maxBlocks = IntegerProperty("Maximum blocks to export and scan (1-500).", 1, 500),
+        maxTagTables = IntegerProperty("Maximum tag tables to export (1-200).", 1, 200),
+        issueLimit = IntegerProperty("Maximum rows returned per finding category (1-2000).", 1, 2000)
     }, ["plc"]),
     Tool("tia_get_block_overview", "Return a compact PLC block overview with hash, language, compile units, and readable network text.", new
     {
@@ -754,6 +766,70 @@ sealed class TiaOpennessReader
         if (value.StartsWith("T", StringComparison.OrdinalIgnoreCase)) return "timer";
         if (value.StartsWith("C", StringComparison.OrdinalIgnoreCase) || value.StartsWith("Z", StringComparison.OrdinalIgnoreCase)) return "counter";
         return "other";
+    }
+
+    public object AuditSymbolUsage(string plc, int maxBlocks, int maxTagTables, int issueLimit)
+    {
+        if (maxBlocks is < 1 or > 500) throw new ArgumentOutOfRangeException(nameof(maxBlocks), "MaxBlocks must be between 1 and 500.");
+        if (maxTagTables is < 1 or > 200) throw new ArgumentOutOfRangeException(nameof(maxTagTables), "MaxTagTables must be between 1 and 200.");
+        if (issueLimit is < 1 or > 2000) throw new ArgumentOutOfRangeException(nameof(issueLimit), "IssueLimit must be between 1 and 2000.");
+        var definitions = new Dictionary<string, List<object>>(StringComparer.OrdinalIgnoreCase);
+        var tables = ListTagTables(plc: plc, limit: maxTagTables).OfType<JsonObject>().ToArray();
+        foreach (var table in tables)
+        {
+            var tableName = table["name"]?.GetValue<string>();
+            if (string.IsNullOrWhiteSpace(tableName)) continue;
+            foreach (var tag in ParseTagEntries(ParseXml(ExportTagTable(plc, tableName)["xml"]!.GetValue<string>())).Take(5000))
+            {
+                if (string.IsNullOrWhiteSpace(tag.Value.Name)) continue;
+                if (!definitions.TryGetValue(tag.Value.Name, out var rows)) definitions[tag.Value.Name] = rows = [];
+                rows.Add(new { table = tableName, group = table["group"]?.GetValue<string>(), tag = tag.Value });
+            }
+        }
+
+        var directReferences = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+        var qualifiedReferences = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+        var blocks = ListBlocks(plc: plc, limit: maxBlocks).OfType<JsonObject>().ToArray();
+        foreach (var block in blocks)
+        {
+            var blockName = block["name"]?.GetValue<string>();
+            var group = block["group"]?.GetValue<string>();
+            if (string.IsNullOrWhiteSpace(blockName)) continue;
+            var document = ParseXml(ExportBlock(plc, blockName, group)["xml"]!.GetValue<string>());
+            foreach (var access in document.Descendants().Where(element => element.Name.LocalName == "Access" &&
+                         string.Equals(element.Attribute("Scope")?.Value, "GlobalVariable", StringComparison.OrdinalIgnoreCase)))
+            {
+                var symbol = JoinComponents(access.Descendants().FirstOrDefault(element => element.Name.LocalName == "Symbol"));
+                if (string.IsNullOrWhiteSpace(symbol)) continue;
+                var target = symbol.Contains('.') ? qualifiedReferences : directReferences;
+                if (!target.TryGetValue(symbol, out var usedBy)) target[symbol] = usedBy = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                usedBy.Add(blockName);
+            }
+        }
+
+        var unusedDefinitions = definitions.Keys.Where(name => !directReferences.ContainsKey(name)).Take(issueLimit)
+            .Select(name => new { name, definitions = definitions[name] }).ToArray();
+        var unresolvedDirect = directReferences.Keys.Where(name => !definitions.ContainsKey(name)).Take(issueLimit)
+            .Select(name => new { symbol = name, usedByBlocks = directReferences[name].OrderBy(value => value, StringComparer.OrdinalIgnoreCase).ToArray() }).ToArray();
+        var resolved = directReferences.Keys.Where(definitions.ContainsKey).OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
+            .Select(name => new { symbol = name, referenceCount = directReferences[name].Count, usedByBlocks = directReferences[name].OrderBy(value => value, StringComparer.OrdinalIgnoreCase).ToArray() }).ToArray();
+        var qualified = qualifiedReferences.OrderBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase).Take(issueLimit)
+            .Select(pair => new { symbolPath = pair.Key, usedByBlocks = pair.Value.OrderBy(value => value, StringComparer.OrdinalIgnoreCase).ToArray(), classification = "qualified-or-db-member-review" }).ToArray();
+        return new
+        {
+            plc, auditedTagTables = tables.Length, scannedBlocks = blocks.Length,
+            truncatedTagTables = tables.Length == maxTagTables, truncatedBlocks = blocks.Length == maxBlocks,
+            definitionCount = definitions.Count, directReferenceCount = directReferences.Count, qualifiedReferenceCount = qualifiedReferences.Count,
+            possiblyUnusedDefinitions = unusedDefinitions,
+            unresolvedDirectGlobalSymbols = unresolvedDirect,
+            resolvedDirectGlobalSymbols = resolved,
+            qualifiedReferences = qualified,
+            notes = new[]
+            {
+                "Possibly unused means no direct GlobalVariable reference was found in the scanned blocks; HMI, alarms, recipes, indirect access, external systems, and unscanned blocks may still use it.",
+                "Qualified symbol paths are reported for review and are not treated as missing PLC tags because they commonly represent DB or structured members."
+            }
+        };
     }
 
     private static Dictionary<string, int> CountBy(IEnumerable<JsonObject> rows, string property) =>
