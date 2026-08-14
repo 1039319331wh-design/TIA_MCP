@@ -88,6 +88,8 @@ url = "http://127.0.0.1:5111/mcp"
 
 准备开始一组分析或变更前，调用 `tia_create_project_snapshot` 建立临时基线；完成后调用 `tia_compare_project_snapshot`，确认实际变化范围与预期一致。快照在内存中保存 30 分钟，桥接重启后失效，不能替代 TIA 项目备份或 Git 提交。
 
+分析参数、状态、配方或实例数据时，先用 `tia_list_data_blocks` 缩小目标，再调用 `tia_get_data_block_overview` 分页读取扁平化成员路径、类型、初始值和注释。遇到嵌套 UDT 或数组时保留完整路径和原始属性，不根据名称猜测业务含义。
+
 ## 写入模式
 
 默认启动是只读的。只有准备执行已经审核的变更时，才在当前 PowerShell 进程中设置密钥并显式开启写入：

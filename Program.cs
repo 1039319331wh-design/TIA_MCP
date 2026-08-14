@@ -100,6 +100,10 @@ app.MapPost("/api/snapshots", (TiaOpennessReader tia, ProjectSnapshotRequest req
     Results.Ok(tia.CreateProjectSnapshot(request.Plc, request.MaxBlocks ?? 500, request.MaxTagTables ?? 200)));
 app.MapGet("/api/snapshots/{snapshotId}/compare", (TiaOpennessReader tia, string snapshotId) =>
     Results.Ok(tia.CompareProjectSnapshot(snapshotId)));
+app.MapGet("/api/data-blocks", (TiaOpennessReader tia, string plc, string? groupContains, string? nameContains, int? offset, int? limit) =>
+    Results.Ok(tia.ListDataBlocks(plc, groupContains, nameContains, offset ?? 0, limit ?? 500)));
+app.MapGet("/api/data-blocks/overview", (TiaOpennessReader tia, string plc, string name, string? group, int? offset, int? limit) =>
+    Results.Ok(tia.GetDataBlockOverview(plc, name, group, offset ?? 0, limit ?? 500)));
 app.MapPost("/api/blocks/preview", (TiaOpennessReader tia, BlockChangeRequest request) =>
     Results.Ok(tia.PreviewBlockChange(request.Plc, request.Name, request.Group, request.BaselineHash, request.Xml)));
 app.MapPost("/api/blocks/apply", (TiaOpennessReader tia, ApplyBlockChangeRequest request) =>
@@ -186,6 +190,12 @@ static object CallTool(JsonObject? parameters, TiaOpennessReader tia)
         "tia_create_project_snapshot" => tia.CreateProjectSnapshot(
             StringArg(arguments, "plc"), IntArg(arguments, "maxBlocks", 500), IntArg(arguments, "maxTagTables", 200)),
         "tia_compare_project_snapshot" => tia.CompareProjectSnapshot(RequiredStringArg(arguments, "snapshotId")),
+        "tia_list_data_blocks" => tia.ListDataBlocks(
+            RequiredStringArg(arguments, "plc"), StringArg(arguments, "groupContains"), StringArg(arguments, "nameContains"),
+            IntArg(arguments, "offset", 0), IntArg(arguments, "limit", 500)),
+        "tia_get_data_block_overview" => tia.GetDataBlockOverview(
+            RequiredStringArg(arguments, "plc"), RequiredStringArg(arguments, "name"), StringArg(arguments, "group"),
+            IntArg(arguments, "offset", 0), IntArg(arguments, "limit", 500)),
         "tia_get_block_overview" => tia.GetBlockOverview(
             RequiredStringArg(arguments, "plc"), RequiredStringArg(arguments, "name"), StringArg(arguments, "group")),
         "tia_search_block_text" => tia.SearchBlockText(
@@ -307,6 +317,22 @@ static object[] ToolDefinitions() =>
     {
         snapshotId = StringProperty("Opaque snapshot ID returned by tia_create_project_snapshot.")
     }, ["snapshotId"]),
+    Tool("tia_list_data_blocks", "List GlobalDB and InstanceDB blocks in one PLC with optional group/name filtering and pagination.", new
+    {
+        plc = StringProperty("Exact PLC software name."),
+        groupContains = StringProperty("Optional block-group path substring."),
+        nameContains = StringProperty("Optional data-block name substring."),
+        offset = IntegerProperty("Number of matching rows to skip.", 0, null),
+        limit = IntegerProperty("Maximum rows to return (1-1000).", 1, 1000)
+    }, ["plc"]),
+    Tool("tia_get_data_block_overview", "Parse a GlobalDB or InstanceDB into flattened member paths, data types, attributes, initial values, and comments.", new
+    {
+        plc = StringProperty("Exact PLC software name."),
+        name = StringProperty("Exact data-block name."),
+        group = StringProperty("Exact block-group path. Optional unless the name is ambiguous."),
+        offset = IntegerProperty("Number of flattened members to skip.", 0, null),
+        limit = IntegerProperty("Maximum flattened members to return (1-2000).", 1, 2000)
+    }, ["plc", "name"]),
     Tool("tia_get_block_overview", "Return a compact PLC block overview with hash, language, compile units, and readable network text.", new
     {
         plc = StringProperty("Exact PLC name."),
@@ -694,6 +720,71 @@ sealed class TiaOpennessReader
             totalMembers = sections.Sum(section => section.members.Length),
             sections
         };
+    }
+
+    public JsonArray ListDataBlocks(string plc, string? groupContains, string? nameContains, int offset, int limit)
+    {
+        if (string.IsNullOrWhiteSpace(plc)) throw new InvalidOperationException("PLC name must not be empty.");
+        return Filter(Execute("blocks"), row =>
+            MatchesExact(row, "plc", plc) && IsDataBlockType(row["type"]?.GetValue<string>()) &&
+            MatchesContains(row, "group", groupContains) && MatchesContains(row, "name", nameContains), offset, limit);
+    }
+
+    public object GetDataBlockOverview(string plc, string name, string? group, int offset, int limit)
+    {
+        if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset), "Offset must not be negative.");
+        if (limit is < 1 or > 2000) throw new ArgumentOutOfRangeException(nameof(limit), "Limit must be between 1 and 2000.");
+        var export = ExportBlock(plc, name, group);
+        var type = export["type"]?.GetValue<string>();
+        if (!IsDataBlockType(type)) throw new InvalidOperationException($"Block '{name}' is not a GlobalDB or InstanceDB (actual type: {type ?? "unknown"}).");
+        var document = ParseXml(export["xml"]!.GetValue<string>());
+        var members = new List<object>();
+        foreach (var section in document.Descendants().Where(element => element.Name.LocalName == "Section"))
+        {
+            var sectionName = section.Attribute("Name")?.Value ?? "Static";
+            foreach (var member in section.Elements().Where(element => element.Name.LocalName == "Member"))
+                FlattenDataBlockMember(member, sectionName, "", 0, members);
+        }
+        var instanceOf = document.Descendants().FirstOrDefault(element => element.Name.LocalName is "InstanceOfName" or "InstanceOf")?.Value.Trim();
+        return new
+        {
+            plc,
+            group = export["group"]?.GetValue<string>(),
+            name, type, instanceOf,
+            baselineHash = export["baselineHash"]?.GetValue<string>(),
+            totalMembers = members.Count, offset, limit,
+            returned = Math.Min(limit, Math.Max(0, members.Count - offset)),
+            members = members.Skip(offset).Take(limit).ToArray()
+        };
+    }
+
+    private static bool IsDataBlockType(string? type) =>
+        string.Equals(type, "GlobalDB", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(type, "InstanceDB", StringComparison.OrdinalIgnoreCase) ||
+        (!string.IsNullOrWhiteSpace(type) && (type.EndsWith("DB", StringComparison.OrdinalIgnoreCase) ||
+         type.Contains("DataBlock", StringComparison.OrdinalIgnoreCase)));
+
+    private static void FlattenDataBlockMember(XElement member, string section, string parentPath, int depth, List<object> rows)
+    {
+        if (depth > 32) throw new InvalidOperationException("Data-block member nesting exceeds the supported depth of 32.");
+        var memberName = member.Attribute("Name")?.Value ?? "<unnamed>";
+        var path = string.IsNullOrEmpty(parentPath) ? memberName : parentPath + "." + memberName;
+        var attributes = member.Attributes().ToDictionary(attribute => attribute.Name.LocalName, attribute => attribute.Value, StringComparer.OrdinalIgnoreCase);
+        string? FindValue(params string[] names) => member.Elements().FirstOrDefault(element => names.Contains(element.Name.LocalName, StringComparer.OrdinalIgnoreCase))?.Value.Trim()
+            ?? member.Descendants().FirstOrDefault(element => names.Contains(element.Name.LocalName, StringComparer.OrdinalIgnoreCase))?.Value.Trim();
+        var comments = member.Elements().Where(element => element.Name.LocalName is "Comment" or "Text")
+            .Select(element => element.Value.Trim()).Where(value => value.Length > 0).Distinct(StringComparer.Ordinal).ToArray();
+        var children = member.Elements().Where(element => element.Name.LocalName == "Member").ToArray();
+        rows.Add(new
+        {
+            section, path, name = memberName, depth,
+            dataType = member.Attribute("Datatype")?.Value ?? member.Attribute("DataType")?.Value,
+            startValue = FindValue("StartValue", "InitialValue", "Value"),
+            accessibility = member.Attribute("Accessibility")?.Value,
+            retain = member.Attribute("Retain")?.Value,
+            attributes, comments, childCount = children.Length
+        });
+        foreach (var child in children) FlattenDataBlockMember(child, section, path, depth + 1, rows);
     }
 
     public object SearchPlcBlocks(string plc, string query, string? type, string? groupContains, int maxBlocks, int limit)
