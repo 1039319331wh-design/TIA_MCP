@@ -24,6 +24,19 @@ namespace TiaOpennessWorker
                     case "projects": data = reader.ListProjects(); break;
                     case "devices": data = reader.ListDevices(); break;
                     case "blocks": data = reader.ListBlocks(); break;
+                    case "plc-types": data = reader.ListPlcTypes(); break;
+                    case "export-plc-type":
+                        if (args.Length < 3) throw new ArgumentException("export-plc-type requires PLC name and type name.");
+                        data = reader.ExportPlcType(args[1], args[2], args.Length > 3 ? args[3] : null);
+                        break;
+                    case "import-new-plc-type":
+                        if (args.Length < 4) throw new ArgumentException("import-new-plc-type requires PLC name, target group path, and XML file path.");
+                        data = reader.ImportNewPlcType(args[1], args[2], args[3]);
+                        break;
+                    case "delete-plc-type":
+                        if (args.Length < 4) throw new ArgumentException("delete-plc-type requires PLC name, type name, and group path.");
+                        data = reader.DeletePlcType(args[1], args[2], args[3]);
+                        break;
                     case "tag-tables": data = reader.ListTagTables(); break;
                     case "export-tag-table":
                         if (args.Length < 3) throw new ArgumentException("export-tag-table requires PLC name and tag table name.");
@@ -76,6 +89,22 @@ namespace TiaOpennessWorker
                     case "save-project":
                         if (args.Length < 2) throw new ArgumentException("save-project requires exact project name.");
                         data = reader.SaveProject(args[1]);
+                        break;
+                    case "create-device":
+                        if (args.Length < 4) throw new ArgumentException("create-device requires type identifier, device name, and device-item name.");
+                        data = reader.CreateDevice(args[1], args[2], args[3]);
+                        break;
+                    case "plug-module":
+                        if (args.Length < 6) throw new ArgumentException("plug-module requires device name, parent item name, type identifier, module name, and slot.");
+                        data = reader.PlugModule(args[1], args[2], args[3], args[4], int.Parse(args[5]));
+                        break;
+                    case "set-hardware-attribute":
+                        if (args.Length < 5) throw new ArgumentException("set-hardware-attribute requires device name, item name, attribute name, and value.");
+                        data = reader.SetHardwareAttribute(args[1], args[2], args[3], args[4]);
+                        break;
+                    case "delete-device":
+                        if (args.Length < 2) throw new ArgumentException("delete-device requires device name.");
+                        data = reader.DeleteDevice(args[1]);
                         break;
                     default: throw new ArgumentException("Unknown command: " + command);
                 }
@@ -137,6 +166,106 @@ namespace TiaOpennessWorker
                     foreach (var item in Enumerate(Get(device, "DeviceItems"))) WalkDeviceItemForBlocks(item, rows);
                 return rows;
             });
+        }
+
+        public object ListPlcTypes()
+        {
+            return WithProject(project =>
+            {
+                var rows = new List<object>();
+                foreach (var device in Enumerate(Get(project, "Devices")))
+                    foreach (var item in Enumerate(Get(device, "DeviceItems"))) WalkDeviceItemForTypes(item, rows);
+                return rows;
+            });
+        }
+
+        private void WalkDeviceItemForTypes(object item, List<object> rows)
+        {
+            var serviceType = assembly.GetType("Siemens.Engineering.HW.Features.SoftwareContainer");
+            var container = serviceType == null ? null : GetService(item, serviceType);
+            var software = container == null ? null : Get(container, "Software");
+            var root = software == null ? null : Get(software, "TypeGroup");
+            if (root != null) WalkTypeGroup(root, Convert.ToString(Get(software, "Name")) ?? "PLC", "", rows);
+            foreach (var child in Enumerate(Get(item, "DeviceItems"))) WalkDeviceItemForTypes(child, rows);
+        }
+
+        private static void WalkTypeGroup(object group, string plc, string parent, List<object> rows)
+        {
+            var groupName = Convert.ToString(Get(group, "Name")) ?? "PLC data types";
+            var path = string.IsNullOrEmpty(parent) ? groupName : parent + "/" + groupName;
+            foreach (var type in Enumerate(Get(group, "Types"))) rows.Add(Row("plc", plc, "group", path, "name", Get(type, "Name"), "type", type.GetType().Name));
+            foreach (var child in Enumerate(Get(group, "Groups"))) WalkTypeGroup(child, plc, path, rows);
+        }
+
+        private static void FindPlcTypes(object group, string parent, string requestedName, string requestedGroup, List<TypeMatch> matches)
+        {
+            var groupName = Convert.ToString(Get(group, "Name")) ?? "PLC data types";
+            var path = string.IsNullOrEmpty(parent) ? groupName : parent + "/" + groupName;
+            foreach (var type in Enumerate(Get(group, "Types")))
+                if (string.Equals(Convert.ToString(Get(type, "Name")), requestedName, StringComparison.OrdinalIgnoreCase) &&
+                    (string.IsNullOrWhiteSpace(requestedGroup) || string.Equals(path, requestedGroup, StringComparison.OrdinalIgnoreCase)))
+                    matches.Add(new TypeMatch { Group = path, Type = type, GroupObject = group });
+            foreach (var child in Enumerate(Get(group, "Groups"))) FindPlcTypes(child, path, requestedName, requestedGroup, matches);
+        }
+
+        public object ExportPlcType(string plcName, string typeName, string groupPath)
+        {
+            return WithProject(project =>
+            {
+                var software = FindPlcSoftware(project, plcName);
+                var root = Get(software, "TypeGroup");
+                var matches = new List<TypeMatch>();
+                FindPlcTypes(root, "", typeName, groupPath, matches);
+                if (matches.Count != 1) throw new InvalidOperationException("Expected exactly one PLC type, found " + matches.Count + ".");
+                var tempPath = Path.Combine(Path.GetTempPath(), "tia-type-" + Guid.NewGuid().ToString("N") + ".xml");
+                try
+                {
+                    var optionType = assembly.GetType("Siemens.Engineering.ExportOptions");
+                    var method = matches[0].Type.GetType().GetMethod("Export", new[] { typeof(FileInfo), optionType });
+                    if (method == null) throw new MissingMethodException(matches[0].Type.GetType().FullName, "Export");
+                    method.Invoke(matches[0].Type, new[] { (object)new FileInfo(tempPath), Enum.Parse(optionType, "WithDefaults") });
+                    return Row("plc", plcName, "group", matches[0].Group, "name", typeName, "xml", File.ReadAllText(tempPath));
+                }
+                finally { if (File.Exists(tempPath)) File.Delete(tempPath); }
+            });
+        }
+
+        public object ImportNewPlcType(string plcName, string groupPath, string xmlPath)
+        {
+            return WithProject(project =>
+            {
+                var software = FindPlcSoftware(project, plcName);
+                var target = FindTypeGroup(Get(software, "TypeGroup"), "", groupPath);
+                if (target == null) throw new InvalidOperationException("Target PLC type group was not found: " + groupPath);
+                var composition = Get(target, "Types");
+                var optionType = assembly.GetType("Siemens.Engineering.ImportOptions");
+                var method = composition.GetType().GetMethod("Import", new[] { typeof(FileInfo), optionType });
+                if (method == null) throw new MissingMethodException(composition.GetType().FullName, "Import");
+                var imported = method.Invoke(composition, new[] { (object)new FileInfo(xmlPath), Enum.Parse(optionType, "Override") });
+                return Row("plc", plcName, "group", groupPath, "importedCount", Enumerate(imported).Count());
+            });
+        }
+
+        public object DeletePlcType(string plcName, string typeName, string groupPath)
+        {
+            return WithProject(project =>
+            {
+                var software = FindPlcSoftware(project, plcName);
+                var matches = new List<TypeMatch>();
+                FindPlcTypes(Get(software, "TypeGroup"), "", typeName, groupPath, matches);
+                if (matches.Count != 1) throw new InvalidOperationException("Expected exactly one PLC type, found " + matches.Count + ".");
+                Invoke(matches[0].Type, "Delete");
+                return Row("plc", plcName, "group", matches[0].Group, "name", typeName, "deleted", true);
+            });
+        }
+
+        private static object FindTypeGroup(object group, string parent, string requestedPath)
+        {
+            var groupName = Convert.ToString(Get(group, "Name")) ?? "PLC data types";
+            var path = string.IsNullOrEmpty(parent) ? groupName : parent + "/" + groupName;
+            if (string.IsNullOrWhiteSpace(requestedPath) || string.Equals(path, requestedPath, StringComparison.OrdinalIgnoreCase)) return group;
+            foreach (var child in Enumerate(Get(group, "Groups"))) { var result = FindTypeGroup(child, path, requestedPath); if (result != null) return result; }
+            return null;
         }
 
         public object ExportBlock(string plcName, string blockName, string groupPath)
@@ -529,6 +658,86 @@ namespace TiaOpennessWorker
             throw new InvalidOperationException("Open project not found: " + projectName);
         }
 
+        public object CreateDevice(string typeIdentifier, string deviceName, string deviceItemName)
+        {
+            return WithProject(project =>
+            {
+                var devices = Get(project, "Devices");
+                if (devices == null) throw new InvalidOperationException("Project device composition was not found.");
+                if (FindDevice(project, deviceName) != null) throw new InvalidOperationException("A device named '" + deviceName + "' already exists.");
+                var create = devices.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                    .FirstOrDefault(method => method.Name == "CreateWithItem" && method.GetParameters().Length == 3);
+                if (create == null) throw new MissingMethodException(devices.GetType().FullName, "CreateWithItem");
+                var created = create.Invoke(devices, new object[] { typeIdentifier, deviceName, deviceItemName });
+                if (created == null) throw new InvalidOperationException("TIA did not return the created device.");
+                return Row("name", deviceName, "deviceItemName", deviceItemName, "typeIdentifier", typeIdentifier, "created", true);
+            });
+        }
+
+        public object PlugModule(string deviceName, string parentItemName, string typeIdentifier, string moduleName, int slot)
+        {
+            return WithProject(project =>
+            {
+                var device = FindDevice(project, deviceName) ?? throw new InvalidOperationException("Device not found: " + deviceName);
+                var parent = FindDeviceItem(device, parentItemName) ?? throw new InvalidOperationException("Parent device item not found: " + parentItemName);
+                var canPlug = parent.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                    .FirstOrDefault(method => method.Name == "CanPlugNew" && method.GetParameters().Length == 3);
+                if (canPlug != null && !(bool)canPlug.Invoke(parent, new object[] { typeIdentifier, moduleName, slot }))
+                    throw new InvalidOperationException("TIA rejected the module/slot combination before creation.");
+                var plug = parent.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                    .FirstOrDefault(method => method.Name == "PlugNew" && method.GetParameters().Length == 3)
+                    ?? throw new MissingMethodException(parent.GetType().FullName, "PlugNew");
+                var created = plug.Invoke(parent, new object[] { typeIdentifier, moduleName, slot });
+                if (created == null) throw new InvalidOperationException("TIA did not return the plugged module.");
+                return Row("device", deviceName, "parent", parentItemName, "name", moduleName, "slot", slot, "typeIdentifier", typeIdentifier, "created", true);
+            });
+        }
+
+        public object SetHardwareAttribute(string deviceName, string itemName, string attributeName, string value)
+        {
+            return WithProject(project =>
+            {
+                var device = FindDevice(project, deviceName) ?? throw new InvalidOperationException("Device not found: " + deviceName);
+                var target = string.Equals(Convert.ToString(Get(device, "Name")), itemName, StringComparison.OrdinalIgnoreCase)
+                    ? device : FindDeviceItem(device, itemName);
+                if (target == null) throw new InvalidOperationException("Hardware item not found: " + itemName);
+                var set = target.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                    .FirstOrDefault(method => method.Name == "SetAttribute" && method.GetParameters().Length == 2)
+                    ?? throw new MissingMethodException(target.GetType().FullName, "SetAttribute");
+                var parameterType = set.GetParameters()[1].ParameterType;
+                object converted = parameterType == typeof(object) || parameterType == typeof(string) ? value : Convert.ChangeType(value, parameterType);
+                set.Invoke(target, new[] { (object)attributeName, converted });
+                return Row("device", deviceName, "item", itemName, "attribute", attributeName, "value", value, "updated", true);
+            });
+        }
+
+        public object DeleteDevice(string deviceName)
+        {
+            return WithProject(project =>
+            {
+                var device = FindDevice(project, deviceName) ?? throw new InvalidOperationException("Device not found: " + deviceName);
+                Invoke(device, "Delete");
+                return Row("name", deviceName, "deleted", true);
+            });
+        }
+
+        private static object FindDevice(object project, string name)
+        {
+            return Enumerate(Get(project, "Devices")).FirstOrDefault(device =>
+                string.Equals(Convert.ToString(Get(device, "Name")), name, StringComparison.OrdinalIgnoreCase));
+        }
+
+        private static object FindDeviceItem(object deviceOrItem, string name)
+        {
+            foreach (var item in Enumerate(Get(deviceOrItem, "DeviceItems")))
+            {
+                if (string.Equals(Convert.ToString(Get(item, "Name")), name, StringComparison.OrdinalIgnoreCase)) return item;
+                var child = FindDeviceItem(item, name);
+                if (child != null) return child;
+            }
+            return null;
+        }
+
         private object FindSoftware(object item, string plcName)
         {
             var serviceType = assembly.GetType("Siemens.Engineering.HW.Features.SoftwareContainer");
@@ -732,6 +941,12 @@ namespace TiaOpennessWorker
             public string Group;
             public string Name;
             public object Block;
+            public object GroupObject;
+        }
+        private sealed class TypeMatch
+        {
+            public string Group;
+            public object Type;
             public object GroupObject;
         }
     }

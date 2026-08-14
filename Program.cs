@@ -114,7 +114,7 @@ app.MapGet("/api/plcs/{plc}/io-audit", (TiaOpennessReader tia, string plc, int? 
 app.MapGet("/api/plcs/{plc}/symbol-usage", (TiaOpennessReader tia, string plc, int? maxBlocks, int? maxTagTables, int? issueLimit) =>
     Results.Ok(tia.AuditSymbolUsage(plc, maxBlocks ?? 200, maxTagTables ?? 200, issueLimit ?? 500)));
 app.MapPost("/api/scl-blocks/prepare", (TiaOpennessReader tia, PrepareSclBlockRequest request) =>
-    Results.Ok(tia.PrepareSclBlock(request.Plc, request.BlockType, request.Name, request.Source)));
+    Results.Ok(tia.PrepareSclBlock(request.Plc, request.BlockType, request.Name, request.Source, request.TargetGroup)));
 app.MapPost("/api/scl-blocks/apply", (TiaOpennessReader tia, ApplyPreparedSclBlockRequest request) =>
     Results.Ok(tia.ApplyPreparedSclBlock(request.ChangeId, request.Confirmation)));
 app.MapGet("/api/scl-blocks/source", (TiaOpennessReader tia, string plc, string name, string? group) =>
@@ -129,6 +129,10 @@ app.MapPost("/api/tag-table-clones/prepare", (TiaOpennessReader tia, PrepareTagT
     Results.Ok(tia.PrepareTagTableClone(request.Plc, request.SourceName, request.NewName, request.TargetGroup)));
 app.MapPost("/api/tag-table-clones/apply", (TiaOpennessReader tia, ApplyPreparedTagTableCloneRequest request) =>
     Results.Ok(tia.ApplyPreparedTagTableClone(request.ChangeId, request.Confirmation)));
+app.MapPost("/api/hardware-template/prepare", (TiaOpennessReader tia, PrepareHardwareTemplateRequest request) =>
+    Results.Ok(tia.PrepareHardwareTemplate(request.WorkbookPath)));
+app.MapPost("/api/hardware-template/apply", (TiaOpennessReader tia, ApplyHardwareTemplateRequest request) =>
+    Results.Ok(tia.ApplyHardwareTemplate(request.ChangeId, request.Confirmation)));
 app.MapPost("/api/blocks/preview", (TiaOpennessReader tia, BlockChangeRequest request) =>
     Results.Ok(tia.PreviewBlockChange(request.Plc, request.Name, request.Group, request.BaselineHash, request.Xml)));
 app.MapPost("/api/blocks/apply", (TiaOpennessReader tia, ApplyBlockChangeRequest request) =>
@@ -233,7 +237,7 @@ static object CallTool(JsonObject? parameters, TiaOpennessReader tia)
             IntArg(arguments, "maxTagTables", 200), IntArg(arguments, "issueLimit", 500)),
         "tia_prepare_scl_block" => tia.PrepareSclBlock(
             RequiredStringArg(arguments, "plc"), RequiredStringArg(arguments, "blockType"),
-            RequiredStringArg(arguments, "name"), RequiredStringArg(arguments, "source")),
+            RequiredStringArg(arguments, "name"), RequiredStringArg(arguments, "source"), StringArg(arguments, "targetGroup")),
         "tia_apply_prepared_scl_block" => tia.ApplyPreparedSclBlock(
             RequiredStringArg(arguments, "changeId"), RequiredStringArg(arguments, "confirmation")),
         "tia_export_scl_block_source" => tia.ExportSclBlockSource(
@@ -250,6 +254,9 @@ static object CallTool(JsonObject? parameters, TiaOpennessReader tia)
             RequiredStringArg(arguments, "plc"), RequiredStringArg(arguments, "sourceName"),
             RequiredStringArg(arguments, "newName"), StringArg(arguments, "targetGroup")),
         "tia_apply_prepared_tag_table_clone" => tia.ApplyPreparedTagTableClone(
+            RequiredStringArg(arguments, "changeId"), RequiredStringArg(arguments, "confirmation")),
+        "tia_prepare_hardware_template" => tia.PrepareHardwareTemplate(RequiredStringArg(arguments, "workbookPath")),
+        "tia_apply_hardware_template" => tia.ApplyHardwareTemplate(
             RequiredStringArg(arguments, "changeId"), RequiredStringArg(arguments, "confirmation")),
         "tia_get_block_overview" => tia.GetBlockOverview(
             RequiredStringArg(arguments, "plc"), RequiredStringArg(arguments, "name"), StringArg(arguments, "group")),
@@ -415,14 +422,15 @@ static object[] ToolDefinitions() =>
         maxTagTables = IntegerProperty("Maximum tag tables to export (1-200).", 1, 200),
         issueLimit = IntegerProperty("Maximum rows returned per finding category (1-2000).", 1, 2000)
     }, ["plc"]),
-    Tool("tia_prepare_scl_block", "Validate and cache a single new SCL FB or FC proposal without changing TIA. Rejects existing block names.", new
+    Tool("tia_prepare_scl_block", "Validate and cache a new SCL OB, FB, FC, DB, or UDT proposal without changing TIA. Rejects existing names.", new
     {
         plc = StringProperty("Exact PLC software name."),
-        blockType = StringProperty("Must be FB or FC."),
+        blockType = StringProperty("Must be OB, FB, FC, DB, or UDT."),
         name = StringProperty("Exact new block name, matching the SCL declaration."),
-        source = StringProperty("Complete SCL source containing exactly one FUNCTION_BLOCK or FUNCTION declaration.")
+        source = StringProperty("Complete SCL source containing exactly one matching declaration."),
+        targetGroup = StringProperty("Existing target block-group path. Defaults to the PLC root block group.")
     }, ["plc", "blockType", "name", "source"]),
-    Tool("tia_apply_prepared_scl_block", "Create a prepared SCL FB/FC in the PLC root block group, compile and verify it, and delete it automatically on failure.", new
+    Tool("tia_apply_prepared_scl_block", "Create a prepared SCL OB/FB/FC/DB or UDT in the requested block/type group, compile and verify it, and delete it automatically on failure.", new
     {
         changeId = StringProperty("Opaque change ID returned by tia_prepare_scl_block."),
         confirmation = StringProperty("Must be exactly CREATE_SCL_BLOCK.")
@@ -464,6 +472,15 @@ static object[] ToolDefinitions() =>
     {
         changeId = StringProperty("Opaque change ID returned by tia_prepare_tag_table_clone."),
         confirmation = StringProperty("Must be exactly CREATE_TAG_TABLE_CLONE.")
+    }, ["changeId", "confirmation"]),
+    Tool("tia_prepare_hardware_template", "Parse and validate the project hardware XLSX template and cache a 30-minute hardware change plan without writing to TIA.", new
+    {
+        workbookPath = StringProperty("Absolute or current-working-directory-relative path to the completed .xlsx hardware template.")
+    }, ["workbookPath"]),
+    Tool("tia_apply_hardware_template", "Apply a prepared hardware plan: create stations by order number, plug modules into slots, configure supported network/address attributes, verify the hardware overview, and roll back newly created devices on failure.", new
+    {
+        changeId = StringProperty("Opaque change ID returned by tia_prepare_hardware_template."),
+        confirmation = StringProperty("Must be exactly APPLY_HARDWARE_TEMPLATE.")
     }, ["changeId", "confirmation"]),
     Tool("tia_get_block_overview", "Return a compact PLC block overview with hash, language, compile units, and readable network text.", new
     {
@@ -563,10 +580,10 @@ static JsonObject RpcError(JsonNode? id, int code, string message) => new()
 
 sealed class RpcException(int code, string message) : Exception(message) { public int Code { get; } = code; }
 
-sealed class TiaOpennessReader
+sealed partial class TiaOpennessReader
 {
     private sealed record PreparedChange(string Plc, string Name, string? Group, string BaselineHash, string ProposedXml, DateTime ExpiresAtUtc);
-    private sealed record PreparedSclBlock(string Plc, string BlockType, string Name, string Source, string SourceHash, DateTime ExpiresAtUtc);
+    private sealed record PreparedSclBlock(string Plc, string BlockType, string Name, string Source, string SourceHash, string TargetGroup, DateTime ExpiresAtUtc);
     private sealed record PreparedBlockClone(string Plc, string SourceName, string? SourceGroup, string NewName,
         string TargetGroup, string BlockType, string Xml, string XmlHash, DateTime ExpiresAtUtc);
     private sealed record PreparedTagTableClone(string Plc, string SourceName, string NewName, string TargetGroup,
@@ -927,39 +944,43 @@ sealed class TiaOpennessReader
         };
     }
 
-    public object PrepareSclBlock(string plc, string blockType, string name, string source)
+    public object PrepareSclBlock(string plc, string blockType, string name, string source, string? targetGroup = null)
     {
         blockType = blockType.Trim().ToUpperInvariant();
         name = name.Trim();
-        if (blockType is not ("FB" or "FC")) throw new InvalidOperationException("BlockType must be FB or FC.");
+        if (blockType is not ("OB" or "FB" or "FC" or "DB" or "UDT")) throw new InvalidOperationException("BlockType must be OB, FB, FC, DB, or UDT.");
         if (!Regex.IsMatch(name, @"^[\p{L}_][\p{L}\p{N}_]{0,124}$", RegexOptions.CultureInvariant))
             throw new InvalidOperationException("Block name must start with a letter or underscore and contain only letters, digits, or underscores.");
         if (string.IsNullOrWhiteSpace(source) || source.Length > 1_000_000) throw new InvalidOperationException("SCL source must contain 1 to 1,000,000 characters.");
         var normalizedSource = source.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n').Trim() + "\n";
-        var declarationPattern = "(?im)^\\s*(FUNCTION_BLOCK|FUNCTION)\\s+(?:\"(?<quoted>[^\"]+)\"|(?<plain>[\\p{L}_][\\p{L}\\p{N}_]*))";
+        var declarationPattern = "(?im)^\\s*(ORGANIZATION_BLOCK|FUNCTION_BLOCK|FUNCTION|DATA_BLOCK|TYPE)\\s+(?:\"(?<quoted>[^\"]+)\"|(?<plain>[\\p{L}_][\\p{L}\\p{N}_]*))";
         var declarations = Regex.Matches(normalizedSource, declarationPattern, RegexOptions.CultureInvariant);
         if (declarations.Count != 1) throw new InvalidOperationException($"SCL source must contain exactly one FB/FC declaration; found {declarations.Count}.");
         var keyword = declarations[0].Groups[1].Value.ToUpperInvariant();
-        var declaredType = keyword == "FUNCTION_BLOCK" ? "FB" : "FC";
+        var declaredType = keyword switch { "ORGANIZATION_BLOCK" => "OB", "FUNCTION_BLOCK" => "FB", "FUNCTION" => "FC", "DATA_BLOCK" => "DB", "TYPE" => "UDT", _ => "" };
         var declaredName = declarations[0].Groups["quoted"].Success ? declarations[0].Groups["quoted"].Value : declarations[0].Groups["plain"].Value;
         if (!string.Equals(declaredType, blockType, StringComparison.Ordinal)) throw new InvalidOperationException($"Declared block type is {declaredType}, expected {blockType}.");
         if (!string.Equals(declaredName, name, StringComparison.Ordinal)) throw new InvalidOperationException($"Declared block name is '{declaredName}', expected '{name}'.");
-        var terminator = blockType == "FB" ? "END_FUNCTION_BLOCK" : "END_FUNCTION";
-        if (!Regex.IsMatch(normalizedSource, @"(?im)^\s*BEGIN\b") || !Regex.IsMatch(normalizedSource, @"(?im)^\s*" + terminator + @"\b"))
-            throw new InvalidOperationException($"SCL source must contain BEGIN and {terminator}.");
-        var existing = ListBlocks(plc: plc, nameContains: name, limit: 1000).OfType<JsonObject>()
-            .Where(row => string.Equals(row["name"]?.GetValue<string>(), name, StringComparison.OrdinalIgnoreCase)).ToArray();
+        var terminator = blockType switch { "OB" => "END_ORGANIZATION_BLOCK", "FB" => "END_FUNCTION_BLOCK", "FC" => "END_FUNCTION", "DB" => "END_DATA_BLOCK", "UDT" => "END_TYPE", _ => "" };
+        if ((blockType != "UDT" && !Regex.IsMatch(normalizedSource, @"(?im)^\s*BEGIN\b")) || !Regex.IsMatch(normalizedSource, @"(?im)^\s*" + terminator + @"\b"))
+            throw new InvalidOperationException(blockType == "UDT" ? $"Source must contain {terminator}." : $"Source must contain BEGIN and {terminator}.");
+        var existing = blockType == "UDT"
+            ? (Execute("plc-types") as JsonArray ?? new JsonArray()).OfType<JsonObject>().Where(row =>
+                string.Equals(row["plc"]?.GetValue<string>(), plc, StringComparison.OrdinalIgnoreCase) && string.Equals(row["name"]?.GetValue<string>(), name, StringComparison.OrdinalIgnoreCase)).ToArray()
+            : ListBlocks(plc: plc, nameContains: name, limit: 1000).OfType<JsonObject>()
+                .Where(row => string.Equals(row["name"]?.GetValue<string>(), name, StringComparison.OrdinalIgnoreCase)).ToArray();
         if (existing.Length > 0) throw new InvalidOperationException($"A block named '{name}' already exists; new-block creation never overwrites existing blocks.");
         RemoveExpiredPreparedSclBlocks();
         var sourceHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(normalizedSource))).ToLowerInvariant();
         var changeId = Convert.ToHexString(RandomNumberGenerator.GetBytes(18)).ToLowerInvariant();
         var expiresAtUtc = DateTime.UtcNow.AddMinutes(30);
-        preparedSclBlocks[changeId] = new PreparedSclBlock(plc, blockType, name, normalizedSource, sourceHash, expiresAtUtc);
+        var destination = string.IsNullOrWhiteSpace(targetGroup) ? "" : targetGroup.Trim();
+        preparedSclBlocks[changeId] = new PreparedSclBlock(plc, blockType, name, normalizedSource, sourceHash, destination, expiresAtUtc);
         return new
         {
             changeId, expiresAtUtc, plc, blockType, name, sourceHash,
             characters = normalizedSource.Length, lines = normalizedSource.Count(character => character == '\n'),
-            targetGroup = "PLC root block group", writeEnabled = IsWriteEnabled(), writePerformed = false,
+            targetGroup = string.IsNullOrEmpty(destination) ? "PLC root block group" : destination, writeEnabled = IsWriteEnabled(), writePerformed = false,
             confirmationRequired = "CREATE_SCL_BLOCK",
             warnings = new[] { "Preparation validates structure and identity only; TIA performs authoritative SCL syntax validation during generation/compile." }
         };
@@ -1009,7 +1030,7 @@ sealed class TiaOpennessReader
         var replacementName = newName.Any(character => char.IsWhiteSpace(character)) ? "\"" + newName + "\"" : newName;
         var variantSource = Regex.Replace(source, declarationPattern, match => match.Groups["prefix"].Value + replacementName,
             RegexOptions.CultureInvariant, TimeSpan.FromSeconds(2));
-        var prepared = PrepareSclBlock(plc, blockType, newName, variantSource);
+        var prepared = PrepareSclBlock(plc, blockType, newName, variantSource, sourceGroup);
         return new
         {
             source = new
@@ -1197,6 +1218,7 @@ sealed class TiaOpennessReader
             throw new InvalidOperationException("Explicit confirmation is required: CREATE_SCL_BLOCK.");
         RemoveExpiredPreparedSclBlocks();
         if (!preparedSclBlocks.TryRemove(changeId, out var change)) throw new InvalidOperationException("Prepared SCL block was not found, expired, or already consumed.");
+        if (change.BlockType == "UDT") return ApplyPreparedUdt(change);
         var existing = ListBlocks(plc: change.Plc, nameContains: change.Name, limit: 1000).OfType<JsonObject>()
             .Where(row => string.Equals(row["name"]?.GetValue<string>(), change.Name, StringComparison.OrdinalIgnoreCase)).ToArray();
         if (existing.Length > 0) throw new InvalidOperationException($"A block named '{change.Name}' now exists; creation was cancelled.");
@@ -1211,10 +1233,31 @@ sealed class TiaOpennessReader
             if (created.Length != 1) throw new InvalidOperationException($"Expected exactly one created block named '{change.Name}', found {created.Length}.");
             var createdGroup = created[0]["group"]?.GetValue<string>() ?? "";
             var export = ExportBlock(change.Plc, change.Name, createdGroup);
+            object? relocationResult = null;
+            if (!string.IsNullOrWhiteSpace(change.TargetGroup) && !string.Equals(createdGroup, change.TargetGroup, StringComparison.OrdinalIgnoreCase))
+            {
+                var relocationPath = Path.Combine(Path.GetTempPath(), "tia-relocate-" + Guid.NewGuid().ToString("N") + ".xml");
+                try
+                {
+                    File.WriteAllText(relocationPath, export["xml"]!.GetValue<string>(), new UTF8Encoding(false));
+                    Execute("delete-block", change.Plc, change.Name, createdGroup);
+                    relocationResult = Execute("import-new-block", change.Plc, change.TargetGroup, relocationPath);
+                    created = ListBlocks(plc: change.Plc, nameContains: change.Name, limit: 1000).OfType<JsonObject>()
+                        .Where(row => string.Equals(row["name"]?.GetValue<string>(), change.Name, StringComparison.OrdinalIgnoreCase)).ToArray();
+                    if (created.Length != 1) throw new InvalidOperationException("Relocated block could not be uniquely verified.");
+                    createdGroup = created[0]["group"]?.GetValue<string>() ?? "";
+                    if (!string.Equals(createdGroup, change.TargetGroup, StringComparison.OrdinalIgnoreCase))
+                        throw new InvalidOperationException($"Block was created in '{createdGroup}', expected '{change.TargetGroup}'.");
+                    export = ExportBlock(change.Plc, change.Name, createdGroup);
+                }
+                finally { if (File.Exists(relocationPath)) File.Delete(relocationPath); }
+            }
             var actualType = export["type"]?.GetValue<string>() ?? "";
             if (!actualType.Contains(change.BlockType, StringComparison.OrdinalIgnoreCase) &&
+                !(change.BlockType == "OB" && actualType.Contains("OrganizationBlock", StringComparison.OrdinalIgnoreCase)) &&
                 !(change.BlockType == "FB" && actualType.Contains("FunctionBlock", StringComparison.OrdinalIgnoreCase)) &&
-                !(change.BlockType == "FC" && actualType.Contains("Function", StringComparison.OrdinalIgnoreCase)))
+                !(change.BlockType == "FC" && actualType.Contains("Function", StringComparison.OrdinalIgnoreCase)) &&
+                !(change.BlockType == "DB" && actualType.Contains("DataBlock", StringComparison.OrdinalIgnoreCase)))
                 throw new InvalidOperationException($"Created block type '{actualType}' does not match requested {change.BlockType}.");
             var compileResult = Execute("compile-plc", change.Plc) as JsonObject ?? throw new InvalidOperationException("PLC compile returned invalid data.");
             var errors = compileResult["errorCount"]?.GetValue<int>() ?? 0;
@@ -1225,7 +1268,7 @@ sealed class TiaOpennessReader
             return new
             {
                 ok = true, change.Plc, change.BlockType, change.Name, group = createdGroup, change.SourceHash,
-                blockHash, importResult, compileResult, projectName,
+                blockHash, importResult, relocationResult, compileResult, projectName,
                 saveEnabled, saveToken = saveEnabled ? CreateSaveToken(projectName, change.Plc, createdGroup, change.Name, blockHash) : null,
                 projectSaved = false, writePerformed = true,
                 saveNotice = saveEnabled
@@ -1250,6 +1293,51 @@ sealed class TiaOpennessReader
                 }
             }
             throw new InvalidOperationException("SCL block creation failed; any uniquely identified created block was deleted automatically.", createException);
+        }
+        finally { if (File.Exists(tempPath)) File.Delete(tempPath); }
+    }
+
+    private object ApplyPreparedUdt(PreparedSclBlock change)
+    {
+        var tempPath = Path.Combine(Path.GetTempPath(), "tia-udt-" + Guid.NewGuid().ToString("N") + ".scl");
+        var sourceName = "Codex_" + change.Name + "_" + Guid.NewGuid().ToString("N")[..8];
+        string? createdGroup = null;
+        try
+        {
+            File.WriteAllText(tempPath, change.Source, new UTF8Encoding(false));
+            var importResult = Execute("import-scl-source", change.Plc, sourceName, tempPath);
+            var created = (Execute("plc-types") as JsonArray ?? new JsonArray()).OfType<JsonObject>().Where(row =>
+                string.Equals(row["plc"]?.GetValue<string>(), change.Plc, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(row["name"]?.GetValue<string>(), change.Name, StringComparison.OrdinalIgnoreCase)).ToArray();
+            if (created.Length != 1) throw new InvalidOperationException($"Expected exactly one created UDT named '{change.Name}', found {created.Length}.");
+            createdGroup = created[0]["group"]?.GetValue<string>() ?? "";
+            var exported = Execute("export-plc-type", change.Plc, change.Name, createdGroup) as JsonObject ?? throw new InvalidOperationException("UDT export failed.");
+            object? relocationResult = null;
+            if (!string.IsNullOrWhiteSpace(change.TargetGroup) && !string.Equals(createdGroup, change.TargetGroup, StringComparison.OrdinalIgnoreCase))
+            {
+                var xmlPath = Path.Combine(Path.GetTempPath(), "tia-udt-relocate-" + Guid.NewGuid().ToString("N") + ".xml");
+                try
+                {
+                    File.WriteAllText(xmlPath, exported["xml"]!.GetValue<string>(), new UTF8Encoding(false));
+                    Execute("delete-plc-type", change.Plc, change.Name, createdGroup);
+                    relocationResult = Execute("import-new-plc-type", change.Plc, change.TargetGroup, xmlPath);
+                    createdGroup = change.TargetGroup;
+                    exported = Execute("export-plc-type", change.Plc, change.Name, createdGroup) as JsonObject ?? throw new InvalidOperationException("Relocated UDT verification failed.");
+                }
+                finally { if (File.Exists(xmlPath)) File.Delete(xmlPath); }
+            }
+            var compileResult = Execute("compile-plc", change.Plc) as JsonObject ?? throw new InvalidOperationException("PLC compile returned invalid data.");
+            if ((compileResult["errorCount"]?.GetValue<int>() ?? 0) > 0) throw new InvalidOperationException("PLC compile failed after UDT creation.");
+            var xmlHash = ComputeBlockHash(exported["xml"]!.GetValue<string>());
+            return new { ok = true, change.Plc, change.Name, blockType = "UDT", group = createdGroup, change.SourceHash,
+                xmlHash, importResult, relocationResult, compileResult, projectSaved = false, writePerformed = true };
+        }
+        catch (Exception createException)
+        {
+            if (!string.IsNullOrWhiteSpace(createdGroup))
+                try { Execute("delete-plc-type", change.Plc, change.Name, createdGroup); Execute("compile-plc", change.Plc); }
+                catch (Exception rollbackException) { throw new AggregateException("UDT creation failed and rollback deletion also failed.", createException, rollbackException); }
+            throw new InvalidOperationException("UDT creation failed; any uniquely identified new type was deleted automatically.", createException);
         }
         finally { if (File.Exists(tempPath)) File.Delete(tempPath); }
     }
@@ -2200,12 +2288,14 @@ sealed record BlockChangeRequest(string Plc, string Name, string? Group, string 
 sealed record ApplyBlockChangeRequest(string Plc, string Name, string? Group, string BaselineHash, string Xml, string ApplyToken);
 sealed record SaveProjectRequest(string ProjectName, string Plc, string Name, string? Group, string ExpectedBlockHash, string SaveToken);
 sealed record ProjectSnapshotRequest(string? Plc, int? MaxBlocks, int? MaxTagTables);
-sealed record PrepareSclBlockRequest(string Plc, string BlockType, string Name, string Source);
+sealed record PrepareSclBlockRequest(string Plc, string BlockType, string Name, string Source, string? TargetGroup);
 sealed record ApplyPreparedSclBlockRequest(string ChangeId, string Confirmation);
 sealed record PrepareSclVariantRequest(string Plc, string SourceName, string? SourceGroup, string NewName);
 sealed record PrepareBlockCloneRequest(string Plc, string SourceName, string? SourceGroup, string NewName, string? TargetGroup);
 sealed record ApplyPreparedBlockCloneRequest(string ChangeId, string Confirmation);
 sealed record PrepareTagTableCloneRequest(string Plc, string SourceName, string NewName, string? TargetGroup);
 sealed record ApplyPreparedTagTableCloneRequest(string ChangeId, string Confirmation);
+sealed record PrepareHardwareTemplateRequest(string WorkbookPath);
+sealed record ApplyHardwareTemplateRequest(string ChangeId, string Confirmation);
 sealed record ChatRequest(string Message, string? PreviousResponseId);
 sealed record OpenAiSettingsRequest(string ApiKey, string? Model);

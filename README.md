@@ -184,6 +184,14 @@ OB/FB/FC/DB（包括 LAD/FBD）可通过 `tia_prepare_block_clone` 以 XML 模�
 
 `tia_export_block` 需要 `plc` 和 `name`，并接受可选的精确 `group` 路径。若存在同名块，必须指定组路径。该工具只导出 XML，不修改工程。
 
+### 通用块、UDT 与 Excel 硬件组态
+
+`tia_prepare_scl_block` 现在接受 `OB`、`FB`、`FC`、`DB` 和 `UDT`。`targetGroup` 可指定已经存在的程序块组；UDT 使用已经存在的 PLC 数据类型组。应用时仍需 `CREATE_SCL_BLOCK`，生成后会验证类型、目标分组并编译，失败时删除本次创建的块或数据类型。
+
+硬件组态采用两阶段流程。先填写仓库中的 `TIA_Hardware_Configuration_Template.xlsx`，然后调用 `tia_prepare_hardware_template` 并传入工作簿路径。预检会解析站点、模块、网络和 I/O 映射，检查必填项、重复 ID、重复地址及站点引用，并返回工作簿 SHA-256 和 30 分钟有效的 `changeId`，不会修改 TIA。
+
+审核计划后调用 `tia_apply_hardware_template`，并传入 `confirmation=APPLY_HARDWARE_TEMPLATE`。应用器使用 `OrderNumber:<订货号>` 创建站点，通过 `PlugNew` 按槽位插入模块，并尝试设置 PROFINET 设备名、IP、子网掩码、网关及模块起始地址。TIA 版本不支持的属性会进入 `warnings`；创建失败时会逆序删除本次新建设备。项目不会自动保存，I/O 映射会在结果中返回，供变量表创建或复核。
+
 导出结果包含忽略易变 `DocumentInfo` 的稳定 `baselineHash`。准备候选 XML 后，调用 `tia_preview_block_change` 并传入：
 
 - `plc`、`name`、可选 `group`
