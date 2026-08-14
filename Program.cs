@@ -121,6 +121,14 @@ app.MapGet("/api/scl-blocks/source", (TiaOpennessReader tia, string plc, string 
     Results.Ok(tia.ExportSclBlockSource(plc, name, group)));
 app.MapPost("/api/scl-blocks/prepare-variant", (TiaOpennessReader tia, PrepareSclVariantRequest request) =>
     Results.Ok(tia.PrepareSclBlockVariant(request.Plc, request.SourceName, request.SourceGroup, request.NewName)));
+app.MapPost("/api/block-clones/prepare", (TiaOpennessReader tia, PrepareBlockCloneRequest request) =>
+    Results.Ok(tia.PrepareBlockClone(request.Plc, request.SourceName, request.SourceGroup, request.NewName, request.TargetGroup)));
+app.MapPost("/api/block-clones/apply", (TiaOpennessReader tia, ApplyPreparedBlockCloneRequest request) =>
+    Results.Ok(tia.ApplyPreparedBlockClone(request.ChangeId, request.Confirmation)));
+app.MapPost("/api/tag-table-clones/prepare", (TiaOpennessReader tia, PrepareTagTableCloneRequest request) =>
+    Results.Ok(tia.PrepareTagTableClone(request.Plc, request.SourceName, request.NewName, request.TargetGroup)));
+app.MapPost("/api/tag-table-clones/apply", (TiaOpennessReader tia, ApplyPreparedTagTableCloneRequest request) =>
+    Results.Ok(tia.ApplyPreparedTagTableClone(request.ChangeId, request.Confirmation)));
 app.MapPost("/api/blocks/preview", (TiaOpennessReader tia, BlockChangeRequest request) =>
     Results.Ok(tia.PreviewBlockChange(request.Plc, request.Name, request.Group, request.BaselineHash, request.Xml)));
 app.MapPost("/api/blocks/apply", (TiaOpennessReader tia, ApplyBlockChangeRequest request) =>
@@ -233,6 +241,16 @@ static object CallTool(JsonObject? parameters, TiaOpennessReader tia)
         "tia_prepare_scl_block_variant" => tia.PrepareSclBlockVariant(
             RequiredStringArg(arguments, "plc"), RequiredStringArg(arguments, "sourceName"),
             StringArg(arguments, "sourceGroup"), RequiredStringArg(arguments, "newName")),
+        "tia_prepare_block_clone" => tia.PrepareBlockClone(
+            RequiredStringArg(arguments, "plc"), RequiredStringArg(arguments, "sourceName"), StringArg(arguments, "sourceGroup"),
+            RequiredStringArg(arguments, "newName"), StringArg(arguments, "targetGroup")),
+        "tia_apply_prepared_block_clone" => tia.ApplyPreparedBlockClone(
+            RequiredStringArg(arguments, "changeId"), RequiredStringArg(arguments, "confirmation")),
+        "tia_prepare_tag_table_clone" => tia.PrepareTagTableClone(
+            RequiredStringArg(arguments, "plc"), RequiredStringArg(arguments, "sourceName"),
+            RequiredStringArg(arguments, "newName"), StringArg(arguments, "targetGroup")),
+        "tia_apply_prepared_tag_table_clone" => tia.ApplyPreparedTagTableClone(
+            RequiredStringArg(arguments, "changeId"), RequiredStringArg(arguments, "confirmation")),
         "tia_get_block_overview" => tia.GetBlockOverview(
             RequiredStringArg(arguments, "plc"), RequiredStringArg(arguments, "name"), StringArg(arguments, "group")),
         "tia_search_block_text" => tia.SearchBlockText(
@@ -422,6 +440,31 @@ static object[] ToolDefinitions() =>
         sourceGroup = StringProperty("Exact source block-group path. Optional unless the name is ambiguous."),
         newName = StringProperty("New block name. Must not already exist.")
     }, ["plc", "sourceName", "newName"]),
+    Tool("tia_prepare_block_clone", "Prepare an exact XML clone of an existing OB/FB/FC/DB, including LAD/FBD networks, with a new name and optional existing target group.", new
+    {
+        plc = StringProperty("Exact PLC software name."),
+        sourceName = StringProperty("Exact existing source block name."),
+        sourceGroup = StringProperty("Exact source group. Optional unless ambiguous."),
+        newName = StringProperty("New unique block name."),
+        targetGroup = StringProperty("Existing target block-group path. Defaults to the source group.")
+    }, ["plc", "sourceName", "newName"]),
+    Tool("tia_apply_prepared_block_clone", "Import a prepared OB/FB/FC/DB XML clone into its target group, compile and verify it, and delete it on failure.", new
+    {
+        changeId = StringProperty("Opaque change ID returned by tia_prepare_block_clone."),
+        confirmation = StringProperty("Must be exactly CREATE_BLOCK_CLONE.")
+    }, ["changeId", "confirmation"]),
+    Tool("tia_prepare_tag_table_clone", "Prepare a renamed XML clone of an existing PLC tag table for an optional existing target group without writing to TIA.", new
+    {
+        plc = StringProperty("Exact PLC software name."),
+        sourceName = StringProperty("Exact unique source tag-table name."),
+        newName = StringProperty("New unique tag-table name."),
+        targetGroup = StringProperty("Existing target tag-table group path. Defaults to the source group.")
+    }, ["plc", "sourceName", "newName"]),
+    Tool("tia_apply_prepared_tag_table_clone", "Import and verify a prepared tag-table clone, deleting it automatically on failure.", new
+    {
+        changeId = StringProperty("Opaque change ID returned by tia_prepare_tag_table_clone."),
+        confirmation = StringProperty("Must be exactly CREATE_TAG_TABLE_CLONE.")
+    }, ["changeId", "confirmation"]),
     Tool("tia_get_block_overview", "Return a compact PLC block overview with hash, language, compile units, and readable network text.", new
     {
         plc = StringProperty("Exact PLC name."),
@@ -524,6 +567,10 @@ sealed class TiaOpennessReader
 {
     private sealed record PreparedChange(string Plc, string Name, string? Group, string BaselineHash, string ProposedXml, DateTime ExpiresAtUtc);
     private sealed record PreparedSclBlock(string Plc, string BlockType, string Name, string Source, string SourceHash, DateTime ExpiresAtUtc);
+    private sealed record PreparedBlockClone(string Plc, string SourceName, string? SourceGroup, string NewName,
+        string TargetGroup, string BlockType, string Xml, string XmlHash, DateTime ExpiresAtUtc);
+    private sealed record PreparedTagTableClone(string Plc, string SourceName, string NewName, string TargetGroup,
+        string Xml, string XmlHash, DateTime ExpiresAtUtc);
     private sealed record ProjectSnapshot(string ProjectName, string Plc, DateTime CreatedAtUtc, DateTime ExpiresAtUtc,
         Dictionary<string, SnapshotItem> Blocks, Dictionary<string, SnapshotItem> TagTables);
     private sealed record SnapshotItem(string Kind, string Name, string? Group, string? Type, string Hash);
@@ -532,6 +579,8 @@ sealed class TiaOpennessReader
     private readonly ConcurrentDictionary<string, byte> consumedSaveTokens = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, PreparedChange> preparedChanges = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, PreparedSclBlock> preparedSclBlocks = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, PreparedBlockClone> preparedBlockClones = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, PreparedTagTableClone> preparedTagTableClones = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, ProjectSnapshot> projectSnapshots = new(StringComparer.Ordinal);
     public object GetStatus()
     {
@@ -982,6 +1031,163 @@ sealed class TiaOpennessReader
         if (string.Equals(type, "FC", StringComparison.OrdinalIgnoreCase) ||
             (type.Contains("Function", StringComparison.OrdinalIgnoreCase) && !type.Contains("FunctionBlock", StringComparison.OrdinalIgnoreCase))) return "FC";
         return null;
+    }
+
+    public object PrepareBlockClone(string plc, string sourceName, string? sourceGroup, string newName, string? targetGroup)
+    {
+        if (!Regex.IsMatch(newName, @"^[\p{L}_][\p{L}\p{N}_]{0,124}$", RegexOptions.CultureInvariant))
+            throw new InvalidOperationException("New block name must start with a letter or underscore and contain only letters, digits, or underscores.");
+        var existing = ListBlocks(plc: plc, nameContains: newName, limit: 1000).OfType<JsonObject>()
+            .Where(row => string.Equals(row["name"]?.GetValue<string>(), newName, StringComparison.OrdinalIgnoreCase)).ToArray();
+        if (existing.Length > 0) throw new InvalidOperationException($"A block named '{newName}' already exists; cloning never overwrites blocks.");
+        var export = ExportBlock(plc, sourceName, sourceGroup);
+        var actualSourceGroup = export["group"]?.GetValue<string>() ?? "";
+        var destination = string.IsNullOrWhiteSpace(targetGroup) ? actualSourceGroup : targetGroup;
+        var document = ParseXml(export["xml"]!.GetValue<string>());
+        var identity = ReadBlockIdentity(document);
+        var attributeList = document.Descendants().FirstOrDefault(element => element.Name.LocalName == "AttributeList" &&
+            element.Elements().Any(child => child.Name.LocalName == "Name" && string.Equals(child.Value, identity.Name, StringComparison.Ordinal)))
+            ?? throw new InvalidOperationException("Source block AttributeList was not found.");
+        var nameElement = attributeList.Elements().First(element => element.Name.LocalName == "Name");
+        nameElement.Value = newName;
+        var autoNumber = attributeList.Elements().FirstOrDefault(element => element.Name.LocalName == "AutoNumber");
+        if (autoNumber is not null) autoNumber.Value = "true";
+        var number = attributeList.Elements().FirstOrDefault(element => element.Name.LocalName == "Number");
+        number?.Remove();
+        ValidateNetworkUIds(document);
+        var xml = document.ToString(SaveOptions.DisableFormatting);
+        var xmlHash = ComputeBlockHash(xml);
+        CleanupExpiredBlockClones();
+        var changeId = Convert.ToHexString(RandomNumberGenerator.GetBytes(18)).ToLowerInvariant();
+        var expiresAtUtc = DateTime.UtcNow.AddMinutes(30);
+        preparedBlockClones[changeId] = new PreparedBlockClone(plc, sourceName, actualSourceGroup, newName, destination, identity.Type, xml, xmlHash, expiresAtUtc);
+        return new
+        {
+            changeId, expiresAtUtc, plc, sourceName, sourceGroup = actualSourceGroup, newName,
+            targetGroup = destination, blockType = identity.Type, xmlHash,
+            programmingLanguages = document.Descendants().Where(element => element.Name.LocalName == "ProgrammingLanguage").Select(element => element.Value).Distinct().ToArray(),
+            exactLogicClone = true, writePerformed = false, confirmationRequired = "CREATE_BLOCK_CLONE",
+            warnings = new[] { "Block number is removed and AutoNumber is enabled so TIA can allocate a non-conflicting number.", "The target group must already exist." }
+        };
+    }
+
+    public object ApplyPreparedBlockClone(string changeId, string confirmation)
+    {
+        if (!IsWriteEnabled()) throw new InvalidOperationException("Block cloning is disabled. Start the bridge with write safeguards enabled.");
+        if (!string.Equals(confirmation, "CREATE_BLOCK_CLONE", StringComparison.Ordinal))
+            throw new InvalidOperationException("Explicit confirmation is required: CREATE_BLOCK_CLONE.");
+        CleanupExpiredBlockClones();
+        if (!preparedBlockClones.TryRemove(changeId, out var change)) throw new InvalidOperationException("Prepared block clone was not found, expired, or already consumed.");
+        if (ListBlocks(plc: change.Plc, nameContains: change.NewName, limit: 1000).OfType<JsonObject>()
+            .Any(row => string.Equals(row["name"]?.GetValue<string>(), change.NewName, StringComparison.OrdinalIgnoreCase)))
+            throw new InvalidOperationException($"A block named '{change.NewName}' now exists; cloning was cancelled.");
+        var tempPath = Path.Combine(Path.GetTempPath(), "tia-clone-" + Guid.NewGuid().ToString("N") + ".xml");
+        try
+        {
+            File.WriteAllText(tempPath, change.Xml, new UTF8Encoding(false));
+            var importResult = Execute("import-new-block", change.Plc, change.TargetGroup, tempPath);
+            var created = ListBlocks(plc: change.Plc, nameContains: change.NewName, limit: 1000).OfType<JsonObject>()
+                .Where(row => string.Equals(row["name"]?.GetValue<string>(), change.NewName, StringComparison.OrdinalIgnoreCase)).ToArray();
+            if (created.Length != 1) throw new InvalidOperationException($"Expected one cloned block named '{change.NewName}', found {created.Length}.");
+            var createdGroup = created[0]["group"]?.GetValue<string>() ?? "";
+            if (!string.Equals(createdGroup, change.TargetGroup, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException($"Clone was created in '{createdGroup}', expected '{change.TargetGroup}'.");
+            var exported = ExportBlock(change.Plc, change.NewName, createdGroup);
+            var compileResult = Execute("compile-plc", change.Plc) as JsonObject ?? throw new InvalidOperationException("PLC compile returned invalid data.");
+            var errors = compileResult["errorCount"]?.GetValue<int>() ?? 0;
+            if (errors > 0) throw new InvalidOperationException($"PLC compile failed with {errors} error(s).");
+            var blockHash = exported["baselineHash"]!.GetValue<string>();
+            return new { ok = true, change.Plc, change.SourceName, change.NewName, group = createdGroup, change.BlockType,
+                preparedXmlHash = change.XmlHash, blockHash, importResult, compileResult, projectSaved = false, writePerformed = true };
+        }
+        catch (Exception cloneException)
+        {
+            var created = ListBlocks(plc: change.Plc, nameContains: change.NewName, limit: 1000).OfType<JsonObject>()
+                .Where(row => string.Equals(row["name"]?.GetValue<string>(), change.NewName, StringComparison.OrdinalIgnoreCase)).ToArray();
+            if (created.Length == 1)
+            {
+                try { Execute("delete-block", change.Plc, change.NewName, created[0]["group"]?.GetValue<string>() ?? ""); Execute("compile-plc", change.Plc); }
+                catch (Exception rollbackException) { throw new AggregateException("Block clone failed and rollback deletion also failed.", cloneException, rollbackException); }
+            }
+            throw new InvalidOperationException("Block clone failed; any uniquely identified clone was deleted automatically.", cloneException);
+        }
+        finally { if (File.Exists(tempPath)) File.Delete(tempPath); }
+    }
+
+    private void CleanupExpiredBlockClones()
+    {
+        var now = DateTime.UtcNow;
+        foreach (var pair in preparedBlockClones.Where(pair => pair.Value.ExpiresAtUtc <= now).ToArray())
+            preparedBlockClones.TryRemove(pair.Key, out _);
+    }
+
+    public object PrepareTagTableClone(string plc, string sourceName, string newName, string? targetGroup)
+    {
+        if (!Regex.IsMatch(newName, @"^[\p{L}_][\p{L}\p{N}_]{0,124}$", RegexOptions.CultureInvariant))
+            throw new InvalidOperationException("New tag-table name must contain only letters, digits, or underscores and start with a letter or underscore.");
+        var tables = ListTagTables(plc: plc, limit: 1000).OfType<JsonObject>().ToArray();
+        var source = tables.Where(row => string.Equals(row["name"]?.GetValue<string>(), sourceName, StringComparison.OrdinalIgnoreCase)).ToArray();
+        if (source.Length != 1) throw new InvalidOperationException($"Expected one source tag table named '{sourceName}', found {source.Length}.");
+        if (tables.Any(row => string.Equals(row["name"]?.GetValue<string>(), newName, StringComparison.OrdinalIgnoreCase)))
+            throw new InvalidOperationException($"A tag table named '{newName}' already exists.");
+        var destination = string.IsNullOrWhiteSpace(targetGroup) ? source[0]["group"]?.GetValue<string>() ?? "" : targetGroup;
+        var export = ExportTagTable(plc, sourceName);
+        var document = ParseXml(export["xml"]!.GetValue<string>());
+        var nameElement = document.Descendants().FirstOrDefault(element => element.Name.LocalName == "Name" && string.Equals(element.Value, sourceName, StringComparison.Ordinal))
+            ?? throw new InvalidOperationException("Tag-table name element was not found in exported XML.");
+        nameElement.Value = newName;
+        var xml = document.ToString(SaveOptions.DisableFormatting);
+        var xmlHash = ComputeBlockHash(xml);
+        CleanupExpiredTagTableClones();
+        var changeId = Convert.ToHexString(RandomNumberGenerator.GetBytes(18)).ToLowerInvariant();
+        var expiresAtUtc = DateTime.UtcNow.AddMinutes(30);
+        preparedTagTableClones[changeId] = new PreparedTagTableClone(plc, sourceName, newName, destination, xml, xmlHash, expiresAtUtc);
+        return new { changeId, expiresAtUtc, plc, sourceName, newName, targetGroup = destination, xmlHash,
+            exactClone = true, writePerformed = false, confirmationRequired = "CREATE_TAG_TABLE_CLONE" };
+    }
+
+    public object ApplyPreparedTagTableClone(string changeId, string confirmation)
+    {
+        if (!IsWriteEnabled()) throw new InvalidOperationException("Tag-table creation is disabled. Start with write safeguards enabled.");
+        if (!string.Equals(confirmation, "CREATE_TAG_TABLE_CLONE", StringComparison.Ordinal))
+            throw new InvalidOperationException("Explicit confirmation is required: CREATE_TAG_TABLE_CLONE.");
+        CleanupExpiredTagTableClones();
+        if (!preparedTagTableClones.TryRemove(changeId, out var change)) throw new InvalidOperationException("Prepared tag-table clone was not found, expired, or consumed.");
+        var tempPath = Path.Combine(Path.GetTempPath(), "tia-tags-" + Guid.NewGuid().ToString("N") + ".xml");
+        try
+        {
+            File.WriteAllText(tempPath, change.Xml, new UTF8Encoding(false));
+            var importResult = Execute("import-new-tag-table", change.Plc, change.TargetGroup, tempPath);
+            var matches = ListTagTables(plc: change.Plc, nameContains: change.NewName, limit: 1000).OfType<JsonObject>()
+                .Where(row => string.Equals(row["name"]?.GetValue<string>(), change.NewName, StringComparison.OrdinalIgnoreCase)).ToArray();
+            if (matches.Length != 1) throw new InvalidOperationException($"Expected one created tag table, found {matches.Length}.");
+            var actualGroup = matches[0]["group"]?.GetValue<string>() ?? "";
+            if (!string.Equals(actualGroup, change.TargetGroup, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException($"Tag table was created in '{actualGroup}', expected '{change.TargetGroup}'.");
+            var exported = ExportTagTable(change.Plc, change.NewName);
+            return new { ok = true, change.Plc, change.SourceName, change.NewName, group = actualGroup,
+                preparedXmlHash = change.XmlHash, tableHash = exported["baselineHash"]?.GetValue<string>(), importResult,
+                projectSaved = false, writePerformed = true };
+        }
+        catch (Exception createException)
+        {
+            var created = ListTagTables(plc: change.Plc, nameContains: change.NewName, limit: 1000).OfType<JsonObject>()
+                .Count(row => string.Equals(row["name"]?.GetValue<string>(), change.NewName, StringComparison.OrdinalIgnoreCase));
+            if (created == 1)
+            {
+                try { Execute("delete-tag-table", change.Plc, change.NewName); }
+                catch (Exception rollbackException) { throw new AggregateException("Tag-table creation failed and rollback deletion also failed.", createException, rollbackException); }
+            }
+            throw new InvalidOperationException("Tag-table creation failed; the created table was deleted automatically.", createException);
+        }
+        finally { if (File.Exists(tempPath)) File.Delete(tempPath); }
+    }
+
+    private void CleanupExpiredTagTableClones()
+    {
+        var now = DateTime.UtcNow;
+        foreach (var pair in preparedTagTableClones.Where(pair => pair.Value.ExpiresAtUtc <= now).ToArray())
+            preparedTagTableClones.TryRemove(pair.Key, out _);
     }
 
     public object ApplyPreparedSclBlock(string changeId, string confirmation)
@@ -1997,5 +2203,9 @@ sealed record ProjectSnapshotRequest(string? Plc, int? MaxBlocks, int? MaxTagTab
 sealed record PrepareSclBlockRequest(string Plc, string BlockType, string Name, string Source);
 sealed record ApplyPreparedSclBlockRequest(string ChangeId, string Confirmation);
 sealed record PrepareSclVariantRequest(string Plc, string SourceName, string? SourceGroup, string NewName);
+sealed record PrepareBlockCloneRequest(string Plc, string SourceName, string? SourceGroup, string NewName, string? TargetGroup);
+sealed record ApplyPreparedBlockCloneRequest(string ChangeId, string Confirmation);
+sealed record PrepareTagTableCloneRequest(string Plc, string SourceName, string NewName, string? TargetGroup);
+sealed record ApplyPreparedTagTableCloneRequest(string ChangeId, string Confirmation);
 sealed record ChatRequest(string Message, string? PreviousResponseId);
 sealed record OpenAiSettingsRequest(string ApiKey, string? Model);

@@ -100,6 +100,8 @@ url = "http://127.0.0.1:5111/mcp"
 
 基于现有 SCL FB/FC 创建变体时，先调用 `tia_export_scl_block_source` 获取原始源码。仅需改名且保持逻辑完全一致时使用 `tia_prepare_scl_block_variant`；需要改变逻辑时，由 Codex修改导出源码并明确列出差异，再调用 `tia_prepare_scl_block`。原块为 LAD/FBD 时只能根据接口和网络分析语义重写，不能声称导出了原始 SCL。
 
+需要保留 LAD/FBD 图形网络、OB 属性或 DB 结构时，使用 `tia_prepare_block_clone` 创建 XML 模板候选，可指定已存在的目标程序块分组；确认后才调用 `tia_apply_prepared_block_clone`。变量表使用对应的 tag-table clone 工具。克隆工具只做精确模板复制和改名，不应声称完成了语义修改；目标分组必须已存在。
+
 ## 写入模式
 
 默认启动是只读的。只有准备执行已经审核的变更时，才在当前 PowerShell 进程中设置密钥并显式开启写入：

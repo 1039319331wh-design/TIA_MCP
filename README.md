@@ -146,6 +146,10 @@ http://<虚拟机IP>:5111/mcp
 - `tia_apply_prepared_scl_block`
 - `tia_export_scl_block_source`
 - `tia_prepare_scl_block_variant`
+- `tia_prepare_block_clone`
+- `tia_apply_prepared_block_clone`
+- `tia_prepare_tag_table_clone`
+- `tia_apply_prepared_tag_table_clone`
 - `tia_export_block`
 - `tia_preview_block_change`
 - `tia_apply_block_change`（默认禁用）
@@ -175,6 +179,8 @@ http://<虚拟机IP>:5111/mcp
 新建 SCL FB/FC 使用两阶段流程：`tia_prepare_scl_block` 验证单一块声明、类型、名称、基本结构和同名冲突，但不写入；审核源码后调用 `tia_apply_prepared_scl_block` 并传入 `confirmation=CREATE_SCL_BLOCK`。应用工具只在显式写入模式下开放，将块创建到 PLC 根程序块组，随后导出验证、编译；任何失败都会尝试删除唯一识别的新块并重新编译。默认不保存项目；启用独立保存权限时，成功结果才返回一次性 `saveToken`。
 
 现有 SCL FB/FC 可通过 `tia_export_scl_block_source` 导出原始 SCL 源码和哈希，临时文件会立即删除。`tia_prepare_scl_block_variant` 会导出源块并只修改单一块声明名称，生成逻辑完全相同的新块候选，但不写入。若需修改逻辑，应先导出源码，由审核者检查完整差异后再把修改后的源码交给 `tia_prepare_scl_block`。LAD/FBD 块不能通过该工具伪装成原始 SCL 源码。
+
+OB/FB/FC/DB（包括 LAD/FBD）可通过 `tia_prepare_block_clone` 以 XML 模板精确克隆，设置新名称并选择一个已存在的目标程序块分组；审核后使用 `tia_apply_prepared_block_clone` 创建、编译和验证，失败时自动删除。TIA 自动分配新块编号。变量表使用对应的 `tia_prepare_tag_table_clone` 和 `tia_apply_prepared_tag_table_clone`，同样支持已存在目标分组、哈希验证和失败删除。
 
 `tia_export_block` 需要 `plc` 和 `name`，并接受可选的精确 `group` 路径。若存在同名块，必须指定组路径。该工具只导出 XML，不修改工程。
 

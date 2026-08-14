@@ -29,6 +29,14 @@ namespace TiaOpennessWorker
                         if (args.Length < 3) throw new ArgumentException("export-tag-table requires PLC name and tag table name.");
                         data = reader.ExportTagTable(args[1], args[2]);
                         break;
+                    case "import-new-tag-table":
+                        if (args.Length < 4) throw new ArgumentException("import-new-tag-table requires PLC name, target group path, and XML file path.");
+                        data = reader.ImportNewTagTable(args[1], args[2], args[3]);
+                        break;
+                    case "delete-tag-table":
+                        if (args.Length < 3) throw new ArgumentException("delete-tag-table requires PLC name and table name.");
+                        data = reader.DeleteTagTable(args[1], args[2]);
+                        break;
                     case "export-block":
                         if (args.Length < 3) throw new ArgumentException("export-block requires PLC name and block name.");
                         data = reader.ExportBlock(args[1], args[2], args.Length > 3 ? args[3] : null);
@@ -36,6 +44,10 @@ namespace TiaOpennessWorker
                     case "import-block":
                         if (args.Length < 5) throw new ArgumentException("import-block requires PLC name, block name, group path, and XML file path.");
                         data = reader.ImportBlock(args[1], args[2], args[3], args[4]);
+                        break;
+                    case "import-new-block":
+                        if (args.Length < 4) throw new ArgumentException("import-new-block requires PLC name, target group path, and XML file path.");
+                        data = reader.ImportNewBlock(args[1], args[2], args[3]);
                         break;
                     case "compile-plc":
                         if (args.Length < 2) throw new ArgumentException("compile-plc requires PLC name.");
@@ -233,6 +245,53 @@ namespace TiaOpennessWorker
             foreach (var child in Enumerate(Get(group, "Groups"))) FindTagTables(child, tableName, matches);
         }
 
+        public object ImportNewTagTable(string plcName, string groupPath, string xmlPath)
+        {
+            if (!File.Exists(xmlPath)) throw new FileNotFoundException("Tag-table XML file not found.", xmlPath);
+            return WithProject(project =>
+            {
+                var software = FindPlcSoftware(project, plcName);
+                var root = Get(software, "TagTableGroup");
+                if (root == null) throw new InvalidOperationException("PLC tag-table root was not found.");
+                var target = FindTagTableGroup(root, "", groupPath);
+                if (target == null) throw new InvalidOperationException("Target tag-table group was not found: " + groupPath);
+                var composition = Get(target, "TagTables");
+                var optionType = assembly.GetType("Siemens.Engineering.ImportOptions");
+                if (composition == null || optionType == null) throw new InvalidOperationException("Tag-table import composition was not found.");
+                var method = composition.GetType().GetMethod("Import", new[] { typeof(FileInfo), optionType });
+                if (method == null) throw new MissingMethodException(composition.GetType().FullName, "Import(FileInfo, ImportOptions)");
+                var imported = method.Invoke(composition, new[] { (object)new FileInfo(xmlPath), Enum.Parse(optionType, "Override") });
+                return Row("plc", plcName, "group", groupPath, "importedCount", Enumerate(imported).Count());
+            });
+        }
+
+        public object DeleteTagTable(string plcName, string tableName)
+        {
+            return WithProject(project =>
+            {
+                var software = FindPlcSoftware(project, plcName);
+                var root = Get(software, "TagTableGroup");
+                var matches = new List<object>();
+                FindTagTables(root, tableName, matches);
+                if (matches.Count != 1) throw new InvalidOperationException("Expected exactly one tag table, found " + matches.Count + ".");
+                Invoke(matches[0], "Delete");
+                return Row("plc", plcName, "name", tableName, "deleted", true);
+            });
+        }
+
+        private static object FindTagTableGroup(object group, string parent, string requestedPath)
+        {
+            var groupName = Convert.ToString(Get(group, "Name")) ?? "PLC tags";
+            var path = string.IsNullOrEmpty(parent) ? groupName : parent + "/" + groupName;
+            if (string.IsNullOrWhiteSpace(requestedPath) || string.Equals(path, requestedPath, StringComparison.OrdinalIgnoreCase)) return group;
+            foreach (var child in Enumerate(Get(group, "Groups")))
+            {
+                var found = FindTagTableGroup(child, path, requestedPath);
+                if (found != null) return found;
+            }
+            return null;
+        }
+
         public object ImportBlock(string plcName, string blockName, string groupPath, string xmlPath)
         {
             if (!File.Exists(xmlPath)) throw new FileNotFoundException("Import XML file not found.", xmlPath);
@@ -254,6 +313,40 @@ namespace TiaOpennessWorker
                 return Row("plc", plcName, "group", matches[0].Group, "name", blockName,
                     "importedCount", Enumerate(imported).Count());
             });
+        }
+
+        public object ImportNewBlock(string plcName, string groupPath, string xmlPath)
+        {
+            if (!File.Exists(xmlPath)) throw new FileNotFoundException("Import XML file not found.", xmlPath);
+            return WithProject(project =>
+            {
+                var software = FindPlcSoftware(project, plcName);
+                var root = Get(software, "BlockGroup");
+                if (root == null) throw new InvalidOperationException("PLC block-group root was not found.");
+                var target = FindBlockGroup(root, "", groupPath);
+                if (target == null) throw new InvalidOperationException("Target block group was not found: " + groupPath);
+                var composition = Get(target, "Blocks");
+                if (composition == null) throw new InvalidOperationException("Target block composition was not found.");
+                var optionType = assembly.GetType("Siemens.Engineering.ImportOptions");
+                if (optionType == null) throw new InvalidOperationException("ImportOptions type not found.");
+                var method = composition.GetType().GetMethod("Import", new[] { typeof(FileInfo), optionType });
+                if (method == null) throw new MissingMethodException(composition.GetType().FullName, "Import(FileInfo, ImportOptions)");
+                var imported = method.Invoke(composition, new[] { (object)new FileInfo(xmlPath), Enum.Parse(optionType, "Override") });
+                return Row("plc", plcName, "group", groupPath, "importedCount", Enumerate(imported).Count());
+            });
+        }
+
+        private static object FindBlockGroup(object group, string parent, string requestedPath)
+        {
+            var groupName = Convert.ToString(Get(group, "Name")) ?? "Program blocks";
+            var path = string.IsNullOrEmpty(parent) ? groupName : parent + "/" + groupName;
+            if (string.IsNullOrWhiteSpace(requestedPath) || string.Equals(path, requestedPath, StringComparison.OrdinalIgnoreCase)) return group;
+            foreach (var child in Enumerate(Get(group, "Groups")))
+            {
+                var found = FindBlockGroup(child, path, requestedPath);
+                if (found != null) return found;
+            }
+            return null;
         }
 
         public object CompilePlc(string plcName)
