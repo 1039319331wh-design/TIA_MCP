@@ -117,6 +117,10 @@ app.MapPost("/api/scl-blocks/prepare", (TiaOpennessReader tia, PrepareSclBlockRe
     Results.Ok(tia.PrepareSclBlock(request.Plc, request.BlockType, request.Name, request.Source)));
 app.MapPost("/api/scl-blocks/apply", (TiaOpennessReader tia, ApplyPreparedSclBlockRequest request) =>
     Results.Ok(tia.ApplyPreparedSclBlock(request.ChangeId, request.Confirmation)));
+app.MapGet("/api/scl-blocks/source", (TiaOpennessReader tia, string plc, string name, string? group) =>
+    Results.Ok(tia.ExportSclBlockSource(plc, name, group)));
+app.MapPost("/api/scl-blocks/prepare-variant", (TiaOpennessReader tia, PrepareSclVariantRequest request) =>
+    Results.Ok(tia.PrepareSclBlockVariant(request.Plc, request.SourceName, request.SourceGroup, request.NewName)));
 app.MapPost("/api/blocks/preview", (TiaOpennessReader tia, BlockChangeRequest request) =>
     Results.Ok(tia.PreviewBlockChange(request.Plc, request.Name, request.Group, request.BaselineHash, request.Xml)));
 app.MapPost("/api/blocks/apply", (TiaOpennessReader tia, ApplyBlockChangeRequest request) =>
@@ -224,6 +228,11 @@ static object CallTool(JsonObject? parameters, TiaOpennessReader tia)
             RequiredStringArg(arguments, "name"), RequiredStringArg(arguments, "source")),
         "tia_apply_prepared_scl_block" => tia.ApplyPreparedSclBlock(
             RequiredStringArg(arguments, "changeId"), RequiredStringArg(arguments, "confirmation")),
+        "tia_export_scl_block_source" => tia.ExportSclBlockSource(
+            RequiredStringArg(arguments, "plc"), RequiredStringArg(arguments, "name"), StringArg(arguments, "group")),
+        "tia_prepare_scl_block_variant" => tia.PrepareSclBlockVariant(
+            RequiredStringArg(arguments, "plc"), RequiredStringArg(arguments, "sourceName"),
+            StringArg(arguments, "sourceGroup"), RequiredStringArg(arguments, "newName")),
         "tia_get_block_overview" => tia.GetBlockOverview(
             RequiredStringArg(arguments, "plc"), RequiredStringArg(arguments, "name"), StringArg(arguments, "group")),
         "tia_search_block_text" => tia.SearchBlockText(
@@ -400,6 +409,19 @@ static object[] ToolDefinitions() =>
         changeId = StringProperty("Opaque change ID returned by tia_prepare_scl_block."),
         confirmation = StringProperty("Must be exactly CREATE_SCL_BLOCK.")
     }, ["changeId", "confirmation"]),
+    Tool("tia_export_scl_block_source", "Generate and return the original SCL source for an existing SCL FB/FC using a temporary local file that is immediately deleted.", new
+    {
+        plc = StringProperty("Exact PLC software name."),
+        name = StringProperty("Exact existing SCL FB/FC name."),
+        group = StringProperty("Exact block-group path. Optional unless the name is ambiguous.")
+    }, ["plc", "name"]),
+    Tool("tia_prepare_scl_block_variant", "Export an existing SCL FB/FC, rename only its declaration, and prepare an exact-logic new-block candidate without writing to TIA.", new
+    {
+        plc = StringProperty("Exact PLC software name."),
+        sourceName = StringProperty("Exact existing SCL FB/FC name."),
+        sourceGroup = StringProperty("Exact source block-group path. Optional unless the name is ambiguous."),
+        newName = StringProperty("New block name. Must not already exist.")
+    }, ["plc", "sourceName", "newName"]),
     Tool("tia_get_block_overview", "Return a compact PLC block overview with hash, language, compile units, and readable network text.", new
     {
         plc = StringProperty("Exact PLC name."),
@@ -892,6 +914,74 @@ sealed class TiaOpennessReader
             confirmationRequired = "CREATE_SCL_BLOCK",
             warnings = new[] { "Preparation validates structure and identity only; TIA performs authoritative SCL syntax validation during generation/compile." }
         };
+    }
+
+    public object ExportSclBlockSource(string plc, string name, string? group)
+    {
+        var block = ListBlocks(plc: plc, nameContains: name, limit: 1000).OfType<JsonObject>()
+            .Where(row => string.Equals(row["name"]?.GetValue<string>(), name, StringComparison.OrdinalIgnoreCase) &&
+                          (string.IsNullOrWhiteSpace(group) || string.Equals(row["group"]?.GetValue<string>(), group, StringComparison.OrdinalIgnoreCase))).ToArray();
+        if (block.Length != 1) throw new InvalidOperationException($"Expected exactly one source block named '{name}', found {block.Length}. Specify its exact group if ambiguous.");
+        var actualGroup = block[0]["group"]?.GetValue<string>() ?? "";
+        var type = NormalizeFbFcType(block[0]["type"]?.GetValue<string>());
+        if (type is null) throw new InvalidOperationException("Only FB and FC source export is supported.");
+        var language = block[0]["programmingLanguage"]?.GetValue<string>();
+        if (!string.Equals(language, "SCL", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException($"Block '{name}' uses {language ?? "unknown"}, not SCL. Original graphical LAD/FBD source cannot be exported as SCL without semantic conversion.");
+        var tempPath = Path.Combine(Path.GetTempPath(), "tia-source-" + Guid.NewGuid().ToString("N") + ".scl");
+        try
+        {
+            var result = Execute("generate-block-source", plc, name, actualGroup, tempPath);
+            if (!File.Exists(tempPath)) throw new InvalidOperationException("TIA did not create the generated SCL source file.");
+            var source = File.ReadAllText(tempPath, Encoding.UTF8).Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n');
+            if (string.IsNullOrWhiteSpace(source)) throw new InvalidOperationException("Generated SCL source is empty.");
+            var sourceHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(source))).ToLowerInvariant();
+            return new
+            {
+                plc, group = actualGroup, name, blockType = type, programmingLanguage = "SCL",
+                sourceHash, characters = source.Length, lines = source.Count(character => character == '\n') + 1,
+                source, generatorResult = result, writePerformed = false
+            };
+        }
+        finally { if (File.Exists(tempPath)) File.Delete(tempPath); }
+    }
+
+    public object PrepareSclBlockVariant(string plc, string sourceName, string? sourceGroup, string newName)
+    {
+        var exported = JsonSerializer.SerializeToNode(ExportSclBlockSource(plc, sourceName, sourceGroup)) as JsonObject
+            ?? throw new InvalidOperationException("SCL source export returned invalid data.");
+        var source = exported["source"]!.GetValue<string>();
+        var blockType = exported["blockType"]!.GetValue<string>();
+        var declarationPattern = blockType == "FB"
+            ? "(?im)^(?<prefix>\\s*FUNCTION_BLOCK\\s+)(?:\"" + Regex.Escape(sourceName) + "\"|" + Regex.Escape(sourceName) + @")(?=\s|:)"
+            : "(?im)^(?<prefix>\\s*FUNCTION\\s+)(?:\"" + Regex.Escape(sourceName) + "\"|" + Regex.Escape(sourceName) + @")(?=\s|:)";
+        var matches = Regex.Matches(source, declarationPattern, RegexOptions.CultureInvariant);
+        if (matches.Count != 1) throw new InvalidOperationException($"Expected exactly one source declaration for '{sourceName}', found {matches.Count}.");
+        var replacementName = newName.Any(character => char.IsWhiteSpace(character)) ? "\"" + newName + "\"" : newName;
+        var variantSource = Regex.Replace(source, declarationPattern, match => match.Groups["prefix"].Value + replacementName,
+            RegexOptions.CultureInvariant, TimeSpan.FromSeconds(2));
+        var prepared = PrepareSclBlock(plc, blockType, newName, variantSource);
+        return new
+        {
+            source = new
+            {
+                plc, group = exported["group"]?.GetValue<string>(), name = sourceName,
+                blockType, sourceHash = exported["sourceHash"]?.GetValue<string>()
+            },
+            variant = prepared,
+            exactLogicClone = true,
+            changeSummary = new[] { $"Renamed the single {blockType} declaration from '{sourceName}' to '{newName}'.", "No other source text was intentionally changed." },
+            writePerformed = false
+        };
+    }
+
+    private static string? NormalizeFbFcType(string? type)
+    {
+        if (string.IsNullOrWhiteSpace(type)) return null;
+        if (string.Equals(type, "FB", StringComparison.OrdinalIgnoreCase) || type.Contains("FunctionBlock", StringComparison.OrdinalIgnoreCase)) return "FB";
+        if (string.Equals(type, "FC", StringComparison.OrdinalIgnoreCase) ||
+            (type.Contains("Function", StringComparison.OrdinalIgnoreCase) && !type.Contains("FunctionBlock", StringComparison.OrdinalIgnoreCase))) return "FC";
+        return null;
     }
 
     public object ApplyPreparedSclBlock(string changeId, string confirmation)
@@ -1906,5 +1996,6 @@ sealed record SaveProjectRequest(string ProjectName, string Plc, string Name, st
 sealed record ProjectSnapshotRequest(string? Plc, int? MaxBlocks, int? MaxTagTables);
 sealed record PrepareSclBlockRequest(string Plc, string BlockType, string Name, string Source);
 sealed record ApplyPreparedSclBlockRequest(string ChangeId, string Confirmation);
+sealed record PrepareSclVariantRequest(string Plc, string SourceName, string? SourceGroup, string NewName);
 sealed record ChatRequest(string Message, string? PreviousResponseId);
 sealed record OpenAiSettingsRequest(string ApiKey, string? Model);

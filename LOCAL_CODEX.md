@@ -98,6 +98,8 @@ url = "http://127.0.0.1:5111/mcp"
 
 新建代码块第一阶段仅支持 SCL FB/FC。先调用 `tia_prepare_scl_block`，审核完整源码、声明类型、块名和源码哈希；只有用户明确确认后才调用 `tia_apply_prepared_scl_block` 并传入 `CREATE_SCL_BLOCK`。创建目标固定为 PLC 根程序块组，不得声称支持任意分组；创建后必须确认编译零错误。失败回滚或保存仍需检查工具结果，禁止自动下载到 PLC。
 
+基于现有 SCL FB/FC 创建变体时，先调用 `tia_export_scl_block_source` 获取原始源码。仅需改名且保持逻辑完全一致时使用 `tia_prepare_scl_block_variant`；需要改变逻辑时，由 Codex修改导出源码并明确列出差异，再调用 `tia_prepare_scl_block`。原块为 LAD/FBD 时只能根据接口和网络分析语义重写，不能声称导出了原始 SCL。
+
 ## 写入模式
 
 默认启动是只读的。只有准备执行已经审核的变更时，才在当前 PowerShell 进程中设置密钥并显式开启写入：
