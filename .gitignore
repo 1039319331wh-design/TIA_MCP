@@ -12,3 +12,7 @@ test-backups/
 !.env.example
 *.local.json
 secrets.json
+node_modules/
+outputs/**/previews/
+outputs/**/inspection.ndjson
+outputs/**/*.inspect.ndjson
