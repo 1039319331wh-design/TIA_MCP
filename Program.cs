@@ -108,6 +108,8 @@ app.MapGet("/api/blocks/networks", (TiaOpennessReader tia, string plc, string na
     Results.Ok(tia.GetBlockNetworks(plc, name, group, offset ?? 0, limit ?? 100)));
 app.MapGet("/api/blocks/references", (TiaOpennessReader tia, string plc, string name, string? group) =>
     Results.Ok(tia.GetBlockReferences(plc, name, group)));
+app.MapGet("/api/plcs/{plc}/io-audit", (TiaOpennessReader tia, string plc, int? maxTagTables, int? issueLimit) =>
+    Results.Ok(tia.AuditPlcIo(plc, maxTagTables ?? 200, issueLimit ?? 500)));
 app.MapPost("/api/blocks/preview", (TiaOpennessReader tia, BlockChangeRequest request) =>
     Results.Ok(tia.PreviewBlockChange(request.Plc, request.Name, request.Group, request.BaselineHash, request.Xml)));
 app.MapPost("/api/blocks/apply", (TiaOpennessReader tia, ApplyBlockChangeRequest request) =>
@@ -205,6 +207,8 @@ static object CallTool(JsonObject? parameters, TiaOpennessReader tia)
             IntArg(arguments, "offset", 0), IntArg(arguments, "limit", 100)),
         "tia_get_block_references" => tia.GetBlockReferences(
             RequiredStringArg(arguments, "plc"), RequiredStringArg(arguments, "name"), StringArg(arguments, "group")),
+        "tia_audit_plc_io" => tia.AuditPlcIo(
+            RequiredStringArg(arguments, "plc"), IntArg(arguments, "maxTagTables", 200), IntArg(arguments, "issueLimit", 500)),
         "tia_get_block_overview" => tia.GetBlockOverview(
             RequiredStringArg(arguments, "plc"), RequiredStringArg(arguments, "name"), StringArg(arguments, "group")),
         "tia_search_block_text" => tia.SearchBlockText(
@@ -356,6 +360,12 @@ static object[] ToolDefinitions() =>
         name = StringProperty("Exact block name."),
         group = StringProperty("Exact block-group path. Optional unless the name is ambiguous.")
     }, ["plc", "name"]),
+    Tool("tia_audit_plc_io", "Audit all PLC tag tables for address/name conflicts, missing types/comments, and address-area distribution without modifying TIA.", new
+    {
+        plc = StringProperty("Exact PLC software name."),
+        maxTagTables = IntegerProperty("Maximum tag tables to export and audit (1-200).", 1, 200),
+        issueLimit = IntegerProperty("Maximum issues returned per issue category (1-2000).", 1, 2000)
+    }, ["plc"]),
     Tool("tia_get_block_overview", "Return a compact PLC block overview with hash, language, compile units, and readable network text.", new
     {
         plc = StringProperty("Exact PLC name."),
@@ -659,7 +669,8 @@ sealed class TiaOpennessReader
         };
     }
 
-    private sealed record ParsedTag(object Value, string SearchText);
+    private sealed record TagValue(string? Name, string? LogicalAddress, string? DataType, string[] Comments);
+    private sealed record ParsedTag(TagValue Value, string SearchText);
 
     private static IEnumerable<ParsedTag> ParseTagEntries(XDocument document)
     {
@@ -673,9 +684,76 @@ sealed class TiaOpennessReader
             var tagName = Read("Name") ?? element.Attribute("Name")?.Value;
             var address = Read("LogicalAddress") ?? Read("Address");
             var dataType = Read("DataTypeName") ?? Read("DataType");
-            var value = new { name = tagName, logicalAddress = address, dataType, comments };
+            var value = new TagValue(tagName, address, dataType, comments);
             yield return new ParsedTag(value, string.Join("\n", new[] { tagName, address, dataType }.Where(text => !string.IsNullOrWhiteSpace(text)).Concat(comments)));
         }
+    }
+
+    public object AuditPlcIo(string plc, int maxTagTables, int issueLimit)
+    {
+        if (maxTagTables is < 1 or > 200) throw new ArgumentOutOfRangeException(nameof(maxTagTables), "MaxTagTables must be between 1 and 200.");
+        if (issueLimit is < 1 or > 2000) throw new ArgumentOutOfRangeException(nameof(issueLimit), "IssueLimit must be between 1 and 2000.");
+        var tables = ListTagTables(plc: plc, limit: maxTagTables).OfType<JsonObject>().ToArray();
+        var tags = new List<AuditedTag>();
+        foreach (var table in tables)
+        {
+            var tableName = table["name"]?.GetValue<string>();
+            var tableGroup = table["group"]?.GetValue<string>();
+            if (string.IsNullOrWhiteSpace(tableName)) continue;
+            var parsed = ParseTagEntries(ParseXml(ExportTagTable(plc, tableName)["xml"]!.GetValue<string>())).Take(5000);
+            tags.AddRange(parsed.Select(tag => new AuditedTag(tableName, tableGroup, tag.Value.Name, tag.Value.LogicalAddress,
+                tag.Value.DataType, tag.Value.Comments, NormalizeAddress(tag.Value.LogicalAddress), ClassifyAddress(tag.Value.LogicalAddress))));
+        }
+        var duplicateAddresses = tags.Where(tag => !string.IsNullOrWhiteSpace(tag.NormalizedAddress))
+            .GroupBy(tag => tag.NormalizedAddress!, StringComparer.OrdinalIgnoreCase).Where(group => group.Count() > 1)
+            .Take(issueLimit).Select(group => new { address = group.Key, tags = group.Select(DescribeAuditedTag).ToArray() }).ToArray();
+        var duplicateNames = tags.Where(tag => !string.IsNullOrWhiteSpace(tag.Name))
+            .GroupBy(tag => tag.Name!, StringComparer.OrdinalIgnoreCase).Where(group => group.Count() > 1)
+            .Take(issueLimit).Select(group => new { name = group.Key, tags = group.Select(DescribeAuditedTag).ToArray() }).ToArray();
+        var missingTypes = tags.Where(tag => string.IsNullOrWhiteSpace(tag.DataType)).Take(issueLimit).Select(DescribeAuditedTag).ToArray();
+        var missingComments = tags.Where(tag => tag.Comments.Length == 0).Take(issueLimit).Select(DescribeAuditedTag).ToArray();
+        return new
+        {
+            plc, auditedTagTables = tables.Length, truncatedTables = tables.Length == maxTagTables, totalTags = tags.Count,
+            byAddressArea = tags.GroupBy(tag => tag.AddressArea, StringComparer.OrdinalIgnoreCase)
+                .OrderBy(group => group.Key, StringComparer.OrdinalIgnoreCase).ToDictionary(group => group.Key, group => group.Count(), StringComparer.OrdinalIgnoreCase),
+            issueCounts = new
+            {
+                duplicateAddressGroups = duplicateAddresses.Length,
+                duplicateNameGroups = duplicateNames.Length,
+                missingTypes = missingTypes.Length,
+                missingComments = missingComments.Length
+            },
+            duplicateAddresses, duplicateNames, missingTypes, missingComments,
+            notes = new[]
+            {
+                "Duplicate addresses are exact normalized textual matches; overlapping bit/byte/word ranges are not inferred.",
+                "Tags without configured logical addresses are excluded from address-conflict checks."
+            }
+        };
+    }
+
+    private sealed record AuditedTag(string Table, string? Group, string? Name, string? Address, string? DataType,
+        string[] Comments, string? NormalizedAddress, string AddressArea);
+    private static object DescribeAuditedTag(AuditedTag tag) => new
+    {
+        table = tag.Table, group = tag.Group, name = tag.Name, logicalAddress = tag.Address,
+        dataType = tag.DataType, comments = tag.Comments, addressArea = tag.AddressArea
+    };
+    private static string? NormalizeAddress(string? address) => string.IsNullOrWhiteSpace(address)
+        ? null : string.Concat(address.Where(character => !char.IsWhiteSpace(character))).ToUpperInvariant();
+    private static string ClassifyAddress(string? address)
+    {
+        var value = NormalizeAddress(address);
+        if (string.IsNullOrWhiteSpace(value)) return "unassigned";
+        value = value.TrimStart('%');
+        if (value.StartsWith("DB", StringComparison.OrdinalIgnoreCase)) return "data-block";
+        if (value.StartsWith("I", StringComparison.OrdinalIgnoreCase) || value.StartsWith("E", StringComparison.OrdinalIgnoreCase)) return "input";
+        if (value.StartsWith("Q", StringComparison.OrdinalIgnoreCase) || value.StartsWith("A", StringComparison.OrdinalIgnoreCase)) return "output";
+        if (value.StartsWith("M", StringComparison.OrdinalIgnoreCase)) return "memory";
+        if (value.StartsWith("T", StringComparison.OrdinalIgnoreCase)) return "timer";
+        if (value.StartsWith("C", StringComparison.OrdinalIgnoreCase) || value.StartsWith("Z", StringComparison.OrdinalIgnoreCase)) return "counter";
+        return "other";
     }
 
     private static Dictionary<string, int> CountBy(IEnumerable<JsonObject> rows, string property) =>

@@ -31,7 +31,7 @@ if (-not $tools.result.tools -or $tools.result.tools.name -notcontains 'tia_stat
 if ($tools.result.tools.name -notcontains 'tia_diagnostics') {
     throw 'MCP tool discovery did not return tia_diagnostics.'
 }
-foreach ($requiredTool in 'tia_list_tag_tables', 'tia_export_tag_table', 'tia_search_tag_table', 'tia_get_plc_overview', 'tia_get_tag_table_overview', 'tia_get_block_interface', 'tia_search_plc_blocks', 'tia_get_block_dependencies', 'tia_get_hardware_overview', 'tia_create_project_snapshot', 'tia_compare_project_snapshot', 'tia_list_data_blocks', 'tia_get_data_block_overview', 'tia_get_block_networks', 'tia_get_block_references') {
+foreach ($requiredTool in 'tia_list_tag_tables', 'tia_export_tag_table', 'tia_search_tag_table', 'tia_get_plc_overview', 'tia_get_tag_table_overview', 'tia_get_block_interface', 'tia_search_plc_blocks', 'tia_get_block_dependencies', 'tia_get_hardware_overview', 'tia_create_project_snapshot', 'tia_compare_project_snapshot', 'tia_list_data_blocks', 'tia_get_data_block_overview', 'tia_get_block_networks', 'tia_get_block_references', 'tia_audit_plc_io') {
     if ($tools.result.tools.name -notcontains $requiredTool) { throw "MCP tool discovery did not return $requiredTool." }
 }
 
