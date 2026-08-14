@@ -84,6 +84,8 @@ url = "http://127.0.0.1:5111/mcp"
 
 分析 FB/FC/DB 契约时调用 `tia_get_block_interface`，优先根据输入、输出、静态变量和注释理解职责。查找一个符号在哪些块中出现时调用 `tia_search_plc_blocks`，并尽量设置块类型、分组和最大扫描块数，避免对大型工程进行无界导出。
 
+需要理解程序调用层级时调用 `tia_get_block_dependencies`，先从根块沿调用边向下分析。硬件拓扑使用 `tia_get_hardware_overview`，但 I/O 地址必须再通过变量表工具核对，不能从模块名称或 `TypeIdentifier` 推断地址。
+
 ## 写入模式
 
 默认启动是只读的。只有准备执行已经审核的变更时，才在当前 PowerShell 进程中设置密钥并显式开启写入：

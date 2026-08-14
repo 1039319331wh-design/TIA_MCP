@@ -92,6 +92,10 @@ app.MapGet("/api/blocks/interface", (TiaOpennessReader tia, string plc, string n
     Results.Ok(tia.GetBlockInterface(plc, name, group)));
 app.MapGet("/api/blocks/search-all", (TiaOpennessReader tia, string plc, string query, string? type, string? groupContains, int? maxBlocks, int? limit) =>
     Results.Ok(tia.SearchPlcBlocks(plc, query, type, groupContains, maxBlocks ?? 100, limit ?? 100)));
+app.MapGet("/api/plcs/{plc}/dependencies", (TiaOpennessReader tia, string plc, int? maxBlocks) =>
+    Results.Ok(tia.GetBlockDependencies(plc, maxBlocks ?? 200)));
+app.MapGet("/api/hardware/overview", (TiaOpennessReader tia, string? nameContains, string? typeContains) =>
+    Results.Ok(tia.GetHardwareOverview(nameContains, typeContains)));
 app.MapPost("/api/blocks/preview", (TiaOpennessReader tia, BlockChangeRequest request) =>
     Results.Ok(tia.PreviewBlockChange(request.Plc, request.Name, request.Group, request.BaselineHash, request.Xml)));
 app.MapPost("/api/blocks/apply", (TiaOpennessReader tia, ApplyBlockChangeRequest request) =>
@@ -171,6 +175,10 @@ static object CallTool(JsonObject? parameters, TiaOpennessReader tia)
             RequiredStringArg(arguments, "plc"), RequiredStringArg(arguments, "query"),
             StringArg(arguments, "type"), StringArg(arguments, "groupContains"),
             IntArg(arguments, "maxBlocks", 100), IntArg(arguments, "limit", 100)),
+        "tia_get_block_dependencies" => tia.GetBlockDependencies(
+            RequiredStringArg(arguments, "plc"), IntArg(arguments, "maxBlocks", 200)),
+        "tia_get_hardware_overview" => tia.GetHardwareOverview(
+            StringArg(arguments, "nameContains"), StringArg(arguments, "typeContains")),
         "tia_get_block_overview" => tia.GetBlockOverview(
             RequiredStringArg(arguments, "plc"), RequiredStringArg(arguments, "name"), StringArg(arguments, "group")),
         "tia_search_block_text" => tia.SearchBlockText(
@@ -272,6 +280,16 @@ static object[] ToolDefinitions() =>
         maxBlocks = IntegerProperty("Maximum blocks to export and scan (1-500).", 1, 500),
         limit = IntegerProperty("Maximum matching blocks to return (1-500).", 1, 500)
     }, ["plc", "query"]),
+    Tool("tia_get_block_dependencies", "Build a read-only PLC block dependency graph by matching LAD/FBD call parts to known block names.", new
+    {
+        plc = StringProperty("Exact PLC software name."),
+        maxBlocks = IntegerProperty("Maximum blocks to export and analyze (1-500).", 1, 500)
+    }, ["plc"]),
+    Tool("tia_get_hardware_overview", "Summarize the open project's hardware hierarchy and module TypeIdentifiers. I/O addresses remain sourced from PLC tag tables.", new
+    {
+        nameContains = StringProperty("Optional case-insensitive device or module name substring."),
+        typeContains = StringProperty("Optional case-insensitive TypeIdentifier substring.")
+    }),
     Tool("tia_get_block_overview", "Return a compact PLC block overview with hash, language, compile units, and readable network text.", new
     {
         plc = StringProperty("Exact PLC name."),
@@ -693,6 +711,68 @@ sealed class TiaOpennessReader
             });
         }
         return new { plc, query, type, groupContains, scannedBlocks = candidates.Length, count = matches.Count, truncated = matches.Count == limit, matches };
+    }
+
+    public object GetBlockDependencies(string plc, int maxBlocks)
+    {
+        if (maxBlocks is < 1 or > 500) throw new ArgumentOutOfRangeException(nameof(maxBlocks), "MaxBlocks must be between 1 and 500.");
+        var blocks = ListBlocks(plc: plc, limit: maxBlocks).OfType<JsonObject>().ToArray();
+        var knownNames = blocks.Select(block => block["name"]?.GetValue<string>()).Where(name => !string.IsNullOrWhiteSpace(name))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var nodes = blocks.Select(block => new
+        {
+            name = block["name"]?.GetValue<string>(),
+            group = block["group"]?.GetValue<string>(),
+            type = block["type"]?.GetValue<string>(),
+            programmingLanguage = block["programmingLanguage"]?.GetValue<string>()
+        }).ToArray();
+        var edges = new List<DependencyEdge>();
+        foreach (var block in blocks)
+        {
+            var source = block["name"]?.GetValue<string>();
+            var group = block["group"]?.GetValue<string>();
+            if (string.IsNullOrWhiteSpace(source)) continue;
+            var export = ExportBlock(plc, source, group);
+            var document = ParseXml(export["xml"]!.GetValue<string>());
+            var targets = document.Descendants().Where(element => element.Name.LocalName == "Part")
+                .Select(element => element.Attribute("Name")?.Value).Where(target => !string.IsNullOrWhiteSpace(target) && knownNames.Contains(target))
+                .Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(target => target, StringComparer.OrdinalIgnoreCase).ToArray();
+            foreach (var target in targets) edges.Add(new DependencyEdge(source, target!, "call"));
+        }
+        var incoming = edges.GroupBy(edge => edge.Target, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.Count(), StringComparer.OrdinalIgnoreCase);
+        var outgoing = edges.GroupBy(edge => edge.Source, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.Count(), StringComparer.OrdinalIgnoreCase);
+        return new
+        {
+            plc, scannedBlocks = blocks.Length, truncated = blocks.Length == maxBlocks,
+            nodeCount = nodes.Length, edgeCount = edges.Count, nodes, edges,
+            roots = nodes.Where(node => node.name is not null && !incoming.ContainsKey(node.name)).Select(node => node.name).ToArray(),
+            leaves = nodes.Where(node => node.name is not null && !outgoing.ContainsKey(node.name)).Select(node => node.name).ToArray()
+        };
+    }
+
+    private sealed record DependencyEdge(string Source, string Target, string Kind);
+
+    public object GetHardwareOverview(string? nameContains, string? typeContains)
+    {
+        var rows = ListDevices(limit: 1000).OfType<JsonObject>()
+            .Where(row => MatchesContains(row, "name", nameContains) && MatchesContains(row, "type", typeContains)).ToArray();
+        return new
+        {
+            total = rows.Length,
+            filters = new { nameContains, typeContains },
+            byKind = CountBy(rows, "kind"),
+            byType = CountBy(rows, "type"),
+            items = rows.Select(row => new
+            {
+                kind = row["kind"]?.GetValue<string>(),
+                name = row["name"]?.GetValue<string>(),
+                parent = row["parent"]?.GetValue<string>(),
+                typeIdentifier = row["type"]?.GetValue<string>()
+            }).ToArray(),
+            addressNote = "Resolve configured symbolic I/O addresses through tia_get_tag_table_overview or tia_search_tag_table; DeviceItem does not expose a uniform address property across supported TIA versions."
+        };
     }
 
     private static object ParseInterfaceMember(XElement member)
