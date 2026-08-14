@@ -86,6 +86,8 @@ url = "http://127.0.0.1:5111/mcp"
 
 需要理解程序调用层级时调用 `tia_get_block_dependencies`，先从根块沿调用边向下分析。硬件拓扑使用 `tia_get_hardware_overview`，但 I/O 地址必须再通过变量表工具核对，不能从模块名称或 `TypeIdentifier` 推断地址。
 
+准备开始一组分析或变更前，调用 `tia_create_project_snapshot` 建立临时基线；完成后调用 `tia_compare_project_snapshot`，确认实际变化范围与预期一致。快照在内存中保存 30 分钟，桥接重启后失效，不能替代 TIA 项目备份或 Git 提交。
+
 ## 写入模式
 
 默认启动是只读的。只有准备执行已经审核的变更时，才在当前 PowerShell 进程中设置密钥并显式开启写入：

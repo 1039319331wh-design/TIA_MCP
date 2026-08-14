@@ -134,6 +134,8 @@ http://<虚拟机IP>:5111/mcp
 - `tia_search_plc_blocks`
 - `tia_get_block_dependencies`
 - `tia_get_hardware_overview`
+- `tia_create_project_snapshot`
+- `tia_compare_project_snapshot`
 - `tia_export_block`
 - `tia_preview_block_change`
 - `tia_apply_block_change`（默认禁用）
@@ -149,6 +151,8 @@ http://<虚拟机IP>:5111/mcp
 `tia_get_block_interface` 将 FB、FC、OB 和 DB 的接口解析为 Input、Output、InOut、Static、Temp、Constant、Return 等区段，并保留嵌套成员和注释。`tia_search_plc_blocks` 可在受限数量的块中搜索符号、注释或调用痕迹；大型项目应通过 `type`、`groupContains` 和 `maxBlocks` 缩小范围。
 
 `tia_get_block_dependencies` 将 LAD/FBD XML 中与已知块名匹配的调用部件整理为节点和边，并返回可能的根块与叶子块。`tia_get_hardware_overview` 返回设备层级、模块名称和 `TypeIdentifier`；不同 TIA 版本的硬件对象没有统一地址属性，因此 I/O 地址继续以变量表工具返回的符号地址为准。
+
+在修改或人工联调前可调用 `tia_create_project_snapshot` 建立临时只读基线，之后使用 `tia_compare_project_snapshot` 检查程序块和变量表的新增、删除与哈希变化。快照只保存在桥接进程内存中，默认 30 分钟失效，服务重启后清空；大型工程可通过最大块数和变量表数限制开销。
 
 `tia_export_block` 需要 `plc` 和 `name`，并接受可选的精确 `group` 路径。若存在同名块，必须指定组路径。该工具只导出 XML，不修改工程。
 

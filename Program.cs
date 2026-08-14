@@ -96,6 +96,10 @@ app.MapGet("/api/plcs/{plc}/dependencies", (TiaOpennessReader tia, string plc, i
     Results.Ok(tia.GetBlockDependencies(plc, maxBlocks ?? 200)));
 app.MapGet("/api/hardware/overview", (TiaOpennessReader tia, string? nameContains, string? typeContains) =>
     Results.Ok(tia.GetHardwareOverview(nameContains, typeContains)));
+app.MapPost("/api/snapshots", (TiaOpennessReader tia, ProjectSnapshotRequest request) =>
+    Results.Ok(tia.CreateProjectSnapshot(request.Plc, request.MaxBlocks ?? 500, request.MaxTagTables ?? 200)));
+app.MapGet("/api/snapshots/{snapshotId}/compare", (TiaOpennessReader tia, string snapshotId) =>
+    Results.Ok(tia.CompareProjectSnapshot(snapshotId)));
 app.MapPost("/api/blocks/preview", (TiaOpennessReader tia, BlockChangeRequest request) =>
     Results.Ok(tia.PreviewBlockChange(request.Plc, request.Name, request.Group, request.BaselineHash, request.Xml)));
 app.MapPost("/api/blocks/apply", (TiaOpennessReader tia, ApplyBlockChangeRequest request) =>
@@ -179,6 +183,9 @@ static object CallTool(JsonObject? parameters, TiaOpennessReader tia)
             RequiredStringArg(arguments, "plc"), IntArg(arguments, "maxBlocks", 200)),
         "tia_get_hardware_overview" => tia.GetHardwareOverview(
             StringArg(arguments, "nameContains"), StringArg(arguments, "typeContains")),
+        "tia_create_project_snapshot" => tia.CreateProjectSnapshot(
+            StringArg(arguments, "plc"), IntArg(arguments, "maxBlocks", 500), IntArg(arguments, "maxTagTables", 200)),
+        "tia_compare_project_snapshot" => tia.CompareProjectSnapshot(RequiredStringArg(arguments, "snapshotId")),
         "tia_get_block_overview" => tia.GetBlockOverview(
             RequiredStringArg(arguments, "plc"), RequiredStringArg(arguments, "name"), StringArg(arguments, "group")),
         "tia_search_block_text" => tia.SearchBlockText(
@@ -290,6 +297,16 @@ static object[] ToolDefinitions() =>
         nameContains = StringProperty("Optional case-insensitive device or module name substring."),
         typeContains = StringProperty("Optional case-insensitive TypeIdentifier substring.")
     }),
+    Tool("tia_create_project_snapshot", "Create a temporary read-only structural and hash snapshot of blocks and tag tables for one PLC or the first PLC found.", new
+    {
+        plc = StringProperty("Optional exact PLC software name. If omitted, the first discovered PLC is selected."),
+        maxBlocks = IntegerProperty("Maximum blocks to snapshot (1-500).", 1, 500),
+        maxTagTables = IntegerProperty("Maximum tag tables to snapshot (1-200).", 1, 200)
+    }),
+    Tool("tia_compare_project_snapshot", "Compare the current TIA project against a temporary snapshot and report added, removed, and changed objects.", new
+    {
+        snapshotId = StringProperty("Opaque snapshot ID returned by tia_create_project_snapshot.")
+    }, ["snapshotId"]),
     Tool("tia_get_block_overview", "Return a compact PLC block overview with hash, language, compile units, and readable network text.", new
     {
         plc = StringProperty("Exact PLC name."),
@@ -391,10 +408,14 @@ sealed class RpcException(int code, string message) : Exception(message) { publi
 sealed class TiaOpennessReader
 {
     private sealed record PreparedChange(string Plc, string Name, string? Group, string BaselineHash, string ProposedXml, DateTime ExpiresAtUtc);
+    private sealed record ProjectSnapshot(string ProjectName, string Plc, DateTime CreatedAtUtc, DateTime ExpiresAtUtc,
+        Dictionary<string, SnapshotItem> Blocks, Dictionary<string, SnapshotItem> TagTables);
+    private sealed record SnapshotItem(string Kind, string Name, string? Group, string? Type, string Hash);
     private sealed record DiagnosticCheck(string Id, bool Ok, string Message, object? Value);
     private readonly ConcurrentDictionary<string, byte> consumedApplyTokens = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, byte> consumedSaveTokens = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, PreparedChange> preparedChanges = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, ProjectSnapshot> projectSnapshots = new(StringComparer.Ordinal);
     public object GetStatus()
     {
         try
@@ -773,6 +794,92 @@ sealed class TiaOpennessReader
             }).ToArray(),
             addressNote = "Resolve configured symbolic I/O addresses through tia_get_tag_table_overview or tia_search_tag_table; DeviceItem does not expose a uniform address property across supported TIA versions."
         };
+    }
+
+    public object CreateProjectSnapshot(string? plc, int maxBlocks, int maxTagTables)
+    {
+        if (maxBlocks is < 1 or > 500) throw new ArgumentOutOfRangeException(nameof(maxBlocks), "MaxBlocks must be between 1 and 500.");
+        if (maxTagTables is < 1 or > 200) throw new ArgumentOutOfRangeException(nameof(maxTagTables), "MaxTagTables must be between 1 and 200.");
+        CleanupExpiredSnapshots();
+        var selectedPlc = !string.IsNullOrWhiteSpace(plc) ? plc : DiscoverFirstPlcName();
+        var snapshot = CaptureSnapshot(selectedPlc, maxBlocks, maxTagTables);
+        var snapshotId = Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant();
+        projectSnapshots[snapshotId] = snapshot;
+        return new
+        {
+            snapshotId, snapshot.ProjectName, snapshot.Plc, snapshot.CreatedAtUtc, snapshot.ExpiresAtUtc,
+            blockCount = snapshot.Blocks.Count, tagTableCount = snapshot.TagTables.Count,
+            warning = snapshot.Blocks.Count == maxBlocks || snapshot.TagTables.Count == maxTagTables
+                ? "Snapshot reached a configured object limit and may be incomplete." : null
+        };
+    }
+
+    public object CompareProjectSnapshot(string snapshotId)
+    {
+        CleanupExpiredSnapshots();
+        if (!projectSnapshots.TryGetValue(snapshotId, out var baseline))
+            throw new InvalidOperationException("Snapshot was not found or has expired. Create a new snapshot.");
+        var currentProject = GetSingleOpenProjectName();
+        if (!string.Equals(currentProject, baseline.ProjectName, StringComparison.Ordinal))
+            throw new InvalidOperationException($"Open project changed: snapshot is for '{baseline.ProjectName}', current project is '{currentProject}'.");
+        var current = CaptureSnapshot(baseline.Plc, Math.Min(500, baseline.Blocks.Count + 100), Math.Min(200, baseline.TagTables.Count + 50));
+        var blockDiff = CompareSnapshotItems(baseline.Blocks, current.Blocks);
+        var tagTableDiff = CompareSnapshotItems(baseline.TagTables, current.TagTables);
+        return new
+        {
+            snapshotId, baseline.ProjectName, baseline.Plc, baseline.CreatedAtUtc, comparedAtUtc = DateTime.UtcNow,
+            changed = blockDiff.ChangeCount + tagTableDiff.ChangeCount > 0,
+            blocks = blockDiff.Value, tagTables = tagTableDiff.Value
+        };
+    }
+
+    private ProjectSnapshot CaptureSnapshot(string plc, int maxBlocks, int maxTagTables)
+    {
+        var blocks = new Dictionary<string, SnapshotItem>(StringComparer.OrdinalIgnoreCase);
+        foreach (var row in ListBlocks(plc: plc, limit: maxBlocks).OfType<JsonObject>())
+        {
+            var name = row["name"]?.GetValue<string>();
+            var group = row["group"]?.GetValue<string>();
+            if (string.IsNullOrWhiteSpace(name)) continue;
+            var export = ExportBlock(plc, name, group);
+            blocks[(group ?? "") + "\0" + name] = new SnapshotItem("block", name, group, row["type"]?.GetValue<string>(), export["baselineHash"]!.GetValue<string>());
+        }
+        var tagTables = new Dictionary<string, SnapshotItem>(StringComparer.OrdinalIgnoreCase);
+        foreach (var row in ListTagTables(plc: plc, limit: maxTagTables).OfType<JsonObject>())
+        {
+            var name = row["name"]?.GetValue<string>();
+            var group = row["group"]?.GetValue<string>();
+            if (string.IsNullOrWhiteSpace(name)) continue;
+            var export = ExportTagTable(plc, name);
+            tagTables[(group ?? "") + "\0" + name] = new SnapshotItem("tagTable", name, group, null, export["baselineHash"]!.GetValue<string>());
+        }
+        var now = DateTime.UtcNow;
+        return new ProjectSnapshot(GetSingleOpenProjectName(), plc, now, now.AddMinutes(30), blocks, tagTables);
+    }
+
+    private sealed record SnapshotDiff(object Value, int ChangeCount);
+    private static SnapshotDiff CompareSnapshotItems(Dictionary<string, SnapshotItem> baseline, Dictionary<string, SnapshotItem> current)
+    {
+        var added = current.Keys.Except(baseline.Keys, StringComparer.OrdinalIgnoreCase).Select(key => current[key]).ToArray();
+        var removed = baseline.Keys.Except(current.Keys, StringComparer.OrdinalIgnoreCase).Select(key => baseline[key]).ToArray();
+        var common = baseline.Keys.Intersect(current.Keys, StringComparer.OrdinalIgnoreCase).ToArray();
+        var changed = common.Where(key => !string.Equals(baseline[key].Hash, current[key].Hash, StringComparison.OrdinalIgnoreCase))
+            .Select(key => new { before = baseline[key], after = current[key] }).ToArray();
+        return new SnapshotDiff(new { added, removed, changed, unchangedCount = common.Length - changed.Length }, added.Length + removed.Length + changed.Length);
+    }
+
+    private string DiscoverFirstPlcName()
+    {
+        var plc = ListBlocks(limit: 1).OfType<JsonObject>().Select(row => row["plc"]?.GetValue<string>()).FirstOrDefault(value => !string.IsNullOrWhiteSpace(value))
+            ?? ListTagTables(limit: 1).OfType<JsonObject>().Select(row => row["plc"]?.GetValue<string>()).FirstOrDefault(value => !string.IsNullOrWhiteSpace(value));
+        return plc ?? throw new InvalidOperationException("No PLC software was found in the open project.");
+    }
+
+    private void CleanupExpiredSnapshots()
+    {
+        var now = DateTime.UtcNow;
+        foreach (var pair in projectSnapshots.Where(pair => pair.Value.ExpiresAtUtc <= now).ToArray())
+            projectSnapshots.TryRemove(pair.Key, out _);
     }
 
     private static object ParseInterfaceMember(XElement member)
@@ -1308,5 +1415,6 @@ sealed class TiaOpennessReader
 sealed record BlockChangeRequest(string Plc, string Name, string? Group, string BaselineHash, string Xml);
 sealed record ApplyBlockChangeRequest(string Plc, string Name, string? Group, string BaselineHash, string Xml, string ApplyToken);
 sealed record SaveProjectRequest(string ProjectName, string Plc, string Name, string? Group, string ExpectedBlockHash, string SaveToken);
+sealed record ProjectSnapshotRequest(string? Plc, int? MaxBlocks, int? MaxTagTables);
 sealed record ChatRequest(string Message, string? PreviousResponseId);
 sealed record OpenAiSettingsRequest(string ApiKey, string? Model);
