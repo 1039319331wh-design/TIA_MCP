@@ -142,6 +142,8 @@ http://<虚拟机IP>:5111/mcp
 - `tia_get_block_references`
 - `tia_audit_plc_io`
 - `tia_audit_symbol_usage`
+- `tia_prepare_scl_block`
+- `tia_apply_prepared_scl_block`
 - `tia_export_block`
 - `tia_preview_block_change`
 - `tia_apply_block_change`（默认禁用）
@@ -167,6 +169,8 @@ http://<虚拟机IP>:5111/mcp
 `tia_audit_plc_io` 遍历指定 PLC 的变量表，统计输入、输出、M 区、DB、定时器和计数器等地址区域，并报告精确地址重复、符号名重复、缺失数据类型和缺失注释。地址冲突仅按标准化后的完整地址文本判断，不推断位、字节、字或双字之间的范围重叠。
 
 `tia_audit_symbol_usage` 将变量表定义与受限数量程序块内的 `GlobalVariable` 引用交叉比对，返回已解析符号、可能未使用定义、未解析直接全局符号以及需复核的 DB/结构成员路径。“可能未使用”不能作为删除依据，因为 HMI、报警、配方、间接访问、外部系统或未扫描块仍可能引用该变量。
+
+新建 SCL FB/FC 使用两阶段流程：`tia_prepare_scl_block` 验证单一块声明、类型、名称、基本结构和同名冲突，但不写入；审核源码后调用 `tia_apply_prepared_scl_block` 并传入 `confirmation=CREATE_SCL_BLOCK`。应用工具只在显式写入模式下开放，将块创建到 PLC 根程序块组，随后导出验证、编译；任何失败都会尝试删除唯一识别的新块并重新编译。默认不保存项目；启用独立保存权限时，成功结果才返回一次性 `saveToken`。
 
 `tia_export_block` 需要 `plc` 和 `name`，并接受可选的精确 `group` 路径。若存在同名块，必须指定组路径。该工具只导出 XML，不修改工程。
 

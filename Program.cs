@@ -6,6 +6,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Xml;
 using System.Xml.Linq;
+using System.Text.RegularExpressions;
 
 var builder = WebApplication.CreateBuilder(args);
 // The bridge is commonly launched as a non-elevated background process. Avoid the
@@ -112,6 +113,10 @@ app.MapGet("/api/plcs/{plc}/io-audit", (TiaOpennessReader tia, string plc, int? 
     Results.Ok(tia.AuditPlcIo(plc, maxTagTables ?? 200, issueLimit ?? 500)));
 app.MapGet("/api/plcs/{plc}/symbol-usage", (TiaOpennessReader tia, string plc, int? maxBlocks, int? maxTagTables, int? issueLimit) =>
     Results.Ok(tia.AuditSymbolUsage(plc, maxBlocks ?? 200, maxTagTables ?? 200, issueLimit ?? 500)));
+app.MapPost("/api/scl-blocks/prepare", (TiaOpennessReader tia, PrepareSclBlockRequest request) =>
+    Results.Ok(tia.PrepareSclBlock(request.Plc, request.BlockType, request.Name, request.Source)));
+app.MapPost("/api/scl-blocks/apply", (TiaOpennessReader tia, ApplyPreparedSclBlockRequest request) =>
+    Results.Ok(tia.ApplyPreparedSclBlock(request.ChangeId, request.Confirmation)));
 app.MapPost("/api/blocks/preview", (TiaOpennessReader tia, BlockChangeRequest request) =>
     Results.Ok(tia.PreviewBlockChange(request.Plc, request.Name, request.Group, request.BaselineHash, request.Xml)));
 app.MapPost("/api/blocks/apply", (TiaOpennessReader tia, ApplyBlockChangeRequest request) =>
@@ -214,6 +219,11 @@ static object CallTool(JsonObject? parameters, TiaOpennessReader tia)
         "tia_audit_symbol_usage" => tia.AuditSymbolUsage(
             RequiredStringArg(arguments, "plc"), IntArg(arguments, "maxBlocks", 200),
             IntArg(arguments, "maxTagTables", 200), IntArg(arguments, "issueLimit", 500)),
+        "tia_prepare_scl_block" => tia.PrepareSclBlock(
+            RequiredStringArg(arguments, "plc"), RequiredStringArg(arguments, "blockType"),
+            RequiredStringArg(arguments, "name"), RequiredStringArg(arguments, "source")),
+        "tia_apply_prepared_scl_block" => tia.ApplyPreparedSclBlock(
+            RequiredStringArg(arguments, "changeId"), RequiredStringArg(arguments, "confirmation")),
         "tia_get_block_overview" => tia.GetBlockOverview(
             RequiredStringArg(arguments, "plc"), RequiredStringArg(arguments, "name"), StringArg(arguments, "group")),
         "tia_search_block_text" => tia.SearchBlockText(
@@ -378,6 +388,18 @@ static object[] ToolDefinitions() =>
         maxTagTables = IntegerProperty("Maximum tag tables to export (1-200).", 1, 200),
         issueLimit = IntegerProperty("Maximum rows returned per finding category (1-2000).", 1, 2000)
     }, ["plc"]),
+    Tool("tia_prepare_scl_block", "Validate and cache a single new SCL FB or FC proposal without changing TIA. Rejects existing block names.", new
+    {
+        plc = StringProperty("Exact PLC software name."),
+        blockType = StringProperty("Must be FB or FC."),
+        name = StringProperty("Exact new block name, matching the SCL declaration."),
+        source = StringProperty("Complete SCL source containing exactly one FUNCTION_BLOCK or FUNCTION declaration.")
+    }, ["plc", "blockType", "name", "source"]),
+    Tool("tia_apply_prepared_scl_block", "Create a prepared SCL FB/FC in the PLC root block group, compile and verify it, and delete it automatically on failure.", new
+    {
+        changeId = StringProperty("Opaque change ID returned by tia_prepare_scl_block."),
+        confirmation = StringProperty("Must be exactly CREATE_SCL_BLOCK.")
+    }, ["changeId", "confirmation"]),
     Tool("tia_get_block_overview", "Return a compact PLC block overview with hash, language, compile units, and readable network text.", new
     {
         plc = StringProperty("Exact PLC name."),
@@ -479,6 +501,7 @@ sealed class RpcException(int code, string message) : Exception(message) { publi
 sealed class TiaOpennessReader
 {
     private sealed record PreparedChange(string Plc, string Name, string? Group, string BaselineHash, string ProposedXml, DateTime ExpiresAtUtc);
+    private sealed record PreparedSclBlock(string Plc, string BlockType, string Name, string Source, string SourceHash, DateTime ExpiresAtUtc);
     private sealed record ProjectSnapshot(string ProjectName, string Plc, DateTime CreatedAtUtc, DateTime ExpiresAtUtc,
         Dictionary<string, SnapshotItem> Blocks, Dictionary<string, SnapshotItem> TagTables);
     private sealed record SnapshotItem(string Kind, string Name, string? Group, string? Type, string Hash);
@@ -486,6 +509,7 @@ sealed class TiaOpennessReader
     private readonly ConcurrentDictionary<string, byte> consumedApplyTokens = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, byte> consumedSaveTokens = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, PreparedChange> preparedChanges = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, PreparedSclBlock> preparedSclBlocks = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, ProjectSnapshot> projectSnapshots = new(StringComparer.Ordinal);
     public object GetStatus()
     {
@@ -830,6 +854,115 @@ sealed class TiaOpennessReader
                 "Qualified symbol paths are reported for review and are not treated as missing PLC tags because they commonly represent DB or structured members."
             }
         };
+    }
+
+    public object PrepareSclBlock(string plc, string blockType, string name, string source)
+    {
+        blockType = blockType.Trim().ToUpperInvariant();
+        name = name.Trim();
+        if (blockType is not ("FB" or "FC")) throw new InvalidOperationException("BlockType must be FB or FC.");
+        if (!Regex.IsMatch(name, @"^[\p{L}_][\p{L}\p{N}_]{0,124}$", RegexOptions.CultureInvariant))
+            throw new InvalidOperationException("Block name must start with a letter or underscore and contain only letters, digits, or underscores.");
+        if (string.IsNullOrWhiteSpace(source) || source.Length > 1_000_000) throw new InvalidOperationException("SCL source must contain 1 to 1,000,000 characters.");
+        var normalizedSource = source.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n').Trim() + "\n";
+        var declarationPattern = "(?im)^\\s*(FUNCTION_BLOCK|FUNCTION)\\s+(?:\"(?<quoted>[^\"]+)\"|(?<plain>[\\p{L}_][\\p{L}\\p{N}_]*))";
+        var declarations = Regex.Matches(normalizedSource, declarationPattern, RegexOptions.CultureInvariant);
+        if (declarations.Count != 1) throw new InvalidOperationException($"SCL source must contain exactly one FB/FC declaration; found {declarations.Count}.");
+        var keyword = declarations[0].Groups[1].Value.ToUpperInvariant();
+        var declaredType = keyword == "FUNCTION_BLOCK" ? "FB" : "FC";
+        var declaredName = declarations[0].Groups["quoted"].Success ? declarations[0].Groups["quoted"].Value : declarations[0].Groups["plain"].Value;
+        if (!string.Equals(declaredType, blockType, StringComparison.Ordinal)) throw new InvalidOperationException($"Declared block type is {declaredType}, expected {blockType}.");
+        if (!string.Equals(declaredName, name, StringComparison.Ordinal)) throw new InvalidOperationException($"Declared block name is '{declaredName}', expected '{name}'.");
+        var terminator = blockType == "FB" ? "END_FUNCTION_BLOCK" : "END_FUNCTION";
+        if (!Regex.IsMatch(normalizedSource, @"(?im)^\s*BEGIN\b") || !Regex.IsMatch(normalizedSource, @"(?im)^\s*" + terminator + @"\b"))
+            throw new InvalidOperationException($"SCL source must contain BEGIN and {terminator}.");
+        var existing = ListBlocks(plc: plc, nameContains: name, limit: 1000).OfType<JsonObject>()
+            .Where(row => string.Equals(row["name"]?.GetValue<string>(), name, StringComparison.OrdinalIgnoreCase)).ToArray();
+        if (existing.Length > 0) throw new InvalidOperationException($"A block named '{name}' already exists; new-block creation never overwrites existing blocks.");
+        RemoveExpiredPreparedSclBlocks();
+        var sourceHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(normalizedSource))).ToLowerInvariant();
+        var changeId = Convert.ToHexString(RandomNumberGenerator.GetBytes(18)).ToLowerInvariant();
+        var expiresAtUtc = DateTime.UtcNow.AddMinutes(30);
+        preparedSclBlocks[changeId] = new PreparedSclBlock(plc, blockType, name, normalizedSource, sourceHash, expiresAtUtc);
+        return new
+        {
+            changeId, expiresAtUtc, plc, blockType, name, sourceHash,
+            characters = normalizedSource.Length, lines = normalizedSource.Count(character => character == '\n'),
+            targetGroup = "PLC root block group", writeEnabled = IsWriteEnabled(), writePerformed = false,
+            confirmationRequired = "CREATE_SCL_BLOCK",
+            warnings = new[] { "Preparation validates structure and identity only; TIA performs authoritative SCL syntax validation during generation/compile." }
+        };
+    }
+
+    public object ApplyPreparedSclBlock(string changeId, string confirmation)
+    {
+        if (!IsWriteEnabled()) throw new InvalidOperationException("SCL block creation is disabled. Start the bridge with write safeguards enabled.");
+        if (!string.Equals(confirmation, "CREATE_SCL_BLOCK", StringComparison.Ordinal))
+            throw new InvalidOperationException("Explicit confirmation is required: CREATE_SCL_BLOCK.");
+        RemoveExpiredPreparedSclBlocks();
+        if (!preparedSclBlocks.TryRemove(changeId, out var change)) throw new InvalidOperationException("Prepared SCL block was not found, expired, or already consumed.");
+        var existing = ListBlocks(plc: change.Plc, nameContains: change.Name, limit: 1000).OfType<JsonObject>()
+            .Where(row => string.Equals(row["name"]?.GetValue<string>(), change.Name, StringComparison.OrdinalIgnoreCase)).ToArray();
+        if (existing.Length > 0) throw new InvalidOperationException($"A block named '{change.Name}' now exists; creation was cancelled.");
+        var tempPath = Path.Combine(Path.GetTempPath(), "tia-scl-" + Guid.NewGuid().ToString("N") + ".scl");
+        var sourceName = "Codex_" + change.Name + "_" + Guid.NewGuid().ToString("N")[..8];
+        try
+        {
+            File.WriteAllText(tempPath, change.Source, new UTF8Encoding(false));
+            var importResult = Execute("import-scl-source", change.Plc, sourceName, tempPath);
+            var created = ListBlocks(plc: change.Plc, nameContains: change.Name, limit: 1000).OfType<JsonObject>()
+                .Where(row => string.Equals(row["name"]?.GetValue<string>(), change.Name, StringComparison.OrdinalIgnoreCase)).ToArray();
+            if (created.Length != 1) throw new InvalidOperationException($"Expected exactly one created block named '{change.Name}', found {created.Length}.");
+            var createdGroup = created[0]["group"]?.GetValue<string>() ?? "";
+            var export = ExportBlock(change.Plc, change.Name, createdGroup);
+            var actualType = export["type"]?.GetValue<string>() ?? "";
+            if (!actualType.Contains(change.BlockType, StringComparison.OrdinalIgnoreCase) &&
+                !(change.BlockType == "FB" && actualType.Contains("FunctionBlock", StringComparison.OrdinalIgnoreCase)) &&
+                !(change.BlockType == "FC" && actualType.Contains("Function", StringComparison.OrdinalIgnoreCase)))
+                throw new InvalidOperationException($"Created block type '{actualType}' does not match requested {change.BlockType}.");
+            var compileResult = Execute("compile-plc", change.Plc) as JsonObject ?? throw new InvalidOperationException("PLC compile returned invalid data.");
+            var errors = compileResult["errorCount"]?.GetValue<int>() ?? 0;
+            if (errors > 0) throw new InvalidOperationException($"PLC compile failed with {errors} error(s).");
+            var projectName = GetSingleOpenProjectName();
+            var blockHash = export["baselineHash"]!.GetValue<string>();
+            var saveEnabled = IsSaveEnabled();
+            return new
+            {
+                ok = true, change.Plc, change.BlockType, change.Name, group = createdGroup, change.SourceHash,
+                blockHash, importResult, compileResult, projectName,
+                saveEnabled, saveToken = saveEnabled ? CreateSaveToken(projectName, change.Plc, createdGroup, change.Name, blockHash) : null,
+                projectSaved = false, writePerformed = true,
+                saveNotice = saveEnabled
+                    ? "The TIA project was not saved. Review the result, then use tia_save_project with the returned one-time token."
+                    : "The TIA project was not saved. Restart with -EnableSave only after review if persistence is required."
+            };
+        }
+        catch (Exception createException)
+        {
+            var created = ListBlocks(plc: change.Plc, nameContains: change.Name, limit: 1000).OfType<JsonObject>()
+                .Where(row => string.Equals(row["name"]?.GetValue<string>(), change.Name, StringComparison.OrdinalIgnoreCase)).ToArray();
+            if (created.Length == 1)
+            {
+                try
+                {
+                    Execute("delete-block", change.Plc, change.Name, created[0]["group"]?.GetValue<string>() ?? "");
+                    Execute("compile-plc", change.Plc);
+                }
+                catch (Exception rollbackException)
+                {
+                    throw new AggregateException("SCL block creation failed and automatic deletion rollback also failed.", createException, rollbackException);
+                }
+            }
+            throw new InvalidOperationException("SCL block creation failed; any uniquely identified created block was deleted automatically.", createException);
+        }
+        finally { if (File.Exists(tempPath)) File.Delete(tempPath); }
+    }
+
+    private void RemoveExpiredPreparedSclBlocks()
+    {
+        var now = DateTime.UtcNow;
+        foreach (var pair in preparedSclBlocks.Where(pair => pair.Value.ExpiresAtUtc <= now).ToArray())
+            preparedSclBlocks.TryRemove(pair.Key, out _);
     }
 
     private static Dictionary<string, int> CountBy(IEnumerable<JsonObject> rows, string property) =>
@@ -1771,5 +1904,7 @@ sealed record BlockChangeRequest(string Plc, string Name, string? Group, string 
 sealed record ApplyBlockChangeRequest(string Plc, string Name, string? Group, string BaselineHash, string Xml, string ApplyToken);
 sealed record SaveProjectRequest(string ProjectName, string Plc, string Name, string? Group, string ExpectedBlockHash, string SaveToken);
 sealed record ProjectSnapshotRequest(string? Plc, int? MaxBlocks, int? MaxTagTables);
+sealed record PrepareSclBlockRequest(string Plc, string BlockType, string Name, string Source);
+sealed record ApplyPreparedSclBlockRequest(string ChangeId, string Confirmation);
 sealed record ChatRequest(string Message, string? PreviousResponseId);
 sealed record OpenAiSettingsRequest(string ApiKey, string? Model);

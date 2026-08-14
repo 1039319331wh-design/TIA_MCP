@@ -341,23 +341,30 @@ namespace TiaOpennessWorker
                     ? (object)Path.GetFullPath(sourcePath) : new FileInfo(sourcePath);
                 var created = create.Invoke(sources, new object[] { sourceName, fileArgument });
                 if (created == null) throw new InvalidOperationException("TIA did not return the created external source.");
-                var generate = created.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance)
-                    .FirstOrDefault(method => method.Name == "GenerateBlocksFromSource" && method.GetParameters().Length == 1);
-                object result;
-                if (generate != null)
+                try
                 {
-                    var optionType = generate.GetParameters()[0].ParameterType;
-                    result = generate.Invoke(created, new[] { Enum.Parse(optionType, "None") });
+                    var generate = created.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                        .FirstOrDefault(method => method.Name == "GenerateBlocksFromSource" && method.GetParameters().Length == 1);
+                    object result;
+                    if (generate != null)
+                    {
+                        var optionType = generate.GetParameters()[0].ParameterType;
+                        result = generate.Invoke(created, new[] { Enum.Parse(optionType, "None") });
+                    }
+                    else
+                    {
+                        generate = created.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                            .FirstOrDefault(method => method.Name == "GenerateBlocksFromSource" && method.GetParameters().Length == 0);
+                        if (generate == null) throw new MissingMethodException(created.GetType().FullName, "GenerateBlocksFromSource");
+                        result = generate.Invoke(created, null);
+                    }
+                    return Row("plc", plcName, "sourceName", sourceName, "sourcePath", sourcePath,
+                        "sourceType", created.GetType().FullName, "generatedResult", Convert.ToString(result));
                 }
-                else
+                finally
                 {
-                    generate = created.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance)
-                        .FirstOrDefault(method => method.Name == "GenerateBlocksFromSource" && method.GetParameters().Length == 0);
-                    if (generate == null) throw new MissingMethodException(created.GetType().FullName, "GenerateBlocksFromSource");
-                    result = generate.Invoke(created, null);
+                    try { Invoke(created, "Delete"); } catch { }
                 }
-                return Row("plc", plcName, "sourceName", sourceName, "sourcePath", sourcePath,
-                    "sourceType", created.GetType().FullName, "generatedResult", Convert.ToString(result));
             });
         }
 
